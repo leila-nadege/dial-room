@@ -116,6 +116,10 @@
   } catch (e) {}
   let token = params.get('t');
   let url = params.get('u');
+  // a saved pass that has expired (or is about to) sends you back to the sign-in
+  try {
+    if (token) { const c = JSON.parse(atob(token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/'))); if (c.exp && c.exp < Date.now() / 1000 + 300) { token = null; url = null; localStorage.removeItem('dialroom'); } }
+  } catch (e) { token = null; url = null; }
 
   function login() {
     return new Promise((resolve) => {
