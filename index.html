@@ -46,7 +46,10 @@
   #chatMsgs div { padding:2px 0; }
   #chatMsgs .pm { color:#c9a7ff; }
   #chatMsgs .from { color:var(--dim); }
-  #chatIn { flex:1; font:inherit; background:#0f1115; color:var(--txt); border:1px solid var(--line); border-radius:8px; padding:6px 8px; min-width:0; }
+  input { font:inherit; background:#0f1115; color:var(--txt); border:1px solid var(--line); border-radius:8px; padding:6px 8px; min-width:0; }
+  #chatIn { flex:1; }
+  #names button.primary { outline:2px solid #fff; }
+  a { color:var(--blue); }
   #app.compact #chatMsgs { max-height:80px; }
   .whisper { background:#3b2a5a; }
   .whisper.on { background:#8a4dff; }
@@ -105,14 +108,54 @@
   const log = (m, cls) => { const el = $('log'); el.className = 'status ' + (cls || ''); el.textContent = m; };
 
   // ---- token from URL fragment ----
+  const DESK = 'https://fngewafxabbrsmeejbgw.supabase.co/functions/v1/dialroom-token';
   let params = new URLSearchParams(location.hash.slice(1));
   try {
     if (params.get('t')) localStorage.setItem('dialroom', location.hash.slice(1));
     else if (localStorage.getItem('dialroom')) params = new URLSearchParams(localStorage.getItem('dialroom'));
   } catch (e) {}
-  const token = params.get('t');
-  const url = params.get('u');
-  if (!token || !url) { $('who').textContent = 'Missing link details. Use your personal Dial Room link.'; return; }
+  let token = params.get('t');
+  let url = params.get('u');
+
+  function login() {
+    return new Promise((resolve) => {
+      const card = document.createElement('div'); card.className = 'card'; card.id = 'loginCard';
+      card.innerHTML = `<div><b>Who are you?</b></div>
+        <div id="names" style="display:flex;flex-wrap:wrap;gap:6px;margin:8px 0"></div>
+        <div style="display:flex;gap:6px"><input id="pin" placeholder="Floor PIN" inputmode="numeric" style="flex:1"><button class="primary" id="joinBtn">Join</button></div>
+        <div class="status" id="loginMsg">Loading names…</div>`;
+      app.insertBefore(card, $('setup'));
+      $('who').textContent = 'Sign in below.';
+      let picked = null;
+      fetch(DESK).then(r => r.json()).then(d => {
+        const box = $('names'); box.innerHTML = '';
+        for (const n of d.names || []) {
+          const b = document.createElement('button'); b.className = 'small'; b.textContent = n.display;
+          b.onclick = () => { picked = n.name; [...box.children].forEach(x => x.classList.remove('primary')); b.classList.add('primary'); $('pin').focus(); };
+          box.appendChild(b);
+        }
+        $('loginMsg').textContent = 'Pick your name, type the floor PIN, press Join.';
+      }).catch(() => { $('loginMsg').textContent = 'Pass desk not reachable. Try again in a minute.'; });
+      async function go() {
+        if (!picked) { $('loginMsg').textContent = 'Pick your name first.'; return; }
+        $('loginMsg').textContent = 'Checking…';
+        try {
+          const r = await fetch(DESK, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: picked, pin: $('pin').value }) });
+          const d = await r.json();
+          if (!r.ok) { $('loginMsg').textContent = d.error === 'wrong pin' ? 'Wrong PIN.' : ('Could not join: ' + (d.error || r.status)); return; }
+          card.remove(); resolve(d);
+        } catch (e) { $('loginMsg').textContent = 'Pass desk not reachable. Try again in a minute.'; }
+      }
+      $('joinBtn').onclick = go;
+      $('pin').addEventListener('keydown', e => { if (e.key === 'Enter') go(); });
+    });
+  }
+
+  if (!token || !url) {
+    const got = await login();
+    token = got.token; url = got.url;
+    try { localStorage.setItem('dialroom', 'u=' + encodeURIComponent(url) + '&t=' + token); } catch (e) {}
+  }
   let claims = {};
   try { claims = JSON.parse(atob(token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/'))); } catch (e) {}
   const myName = claims.name || claims.sub || 'me';
@@ -367,7 +410,8 @@
       attachVideo(cam, myId, myName + ' (you)'); tileFor(myId, myName + ' (you)').classList.add('me');
     } catch (e) { $('camBtn').disabled = true; $('camBtn').textContent = 'No camera'; }
     await room.localParticipant.setAttributes({ state: 'floor', listening: '' });
-    $('who').textContent = `You are ${myName}. Room: floor.`;
+    $('who').innerHTML = `You are ${myName}. Room: floor. <a href="#" id="switch">Not you?</a>`;
+    $('switch').onclick = (e) => { e.preventDefault(); try { localStorage.removeItem('dialroom'); } catch (x) {} location.hash = ''; location.reload(); };
     applySubscriptions(); render();
   } catch (e) {
     $('who').textContent = 'Could not connect: ' + (e && e.message ? e.message : e);
