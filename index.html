@@ -80,7 +80,7 @@
   </div>
 
   <div class="card">
-    <div class="dim" style="margin-bottom:4px">Floor. When someone is on a call, a blue <b>Listen in</b> button appears next to their name.</div>
+    <div class="dim" style="margin-bottom:4px">Floor. When someone is on a call their tile turns red. Click it to listen in.</div>
     <div id="tiles"></div>
     <div id="people"></div>
   </div>
@@ -255,9 +255,7 @@
       row.className = 'row';
       const isL = listening === p.identity;
       row.innerHTML = `<div><span class="name">${p.name || p.identity}</span> <span class="pill ${st}">${st === 'call' ? 'On a call' : 'On the floor'}</span>${at.mic === 'muted' ? ' <span class="pill muted">🔇 muted</span>' : ''}
-        ${at.listening ? `<div class="dim">listening to ${(remote(at.listening)?.name) || (at.listening === myId ? 'you' : at.listening)}</div>` : ''}</div>
-        <button class="small ${isL ? 'call' : 'primary'}" ${st !== 'call' && !isL ? 'disabled' : ''}>${isL ? 'Stop' : 'Listen in'}</button>`;
-      row.querySelector('button').onclick = () => listenTo(isL ? null : p.identity);
+        ${at.listening ? `<div class="dim">listening to ${(remote(at.listening)?.name) || (at.listening === myId ? 'you' : at.listening)}</div>` : ''}${isL ? '<div class="dim" style="color:var(--blue)">you are listening to this call</div>' : ''}</div>`;
       box.appendChild(row);
     }
     for (const p of people) {
