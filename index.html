@@ -34,7 +34,14 @@
   .tile { position:relative; background:#000; border-radius:10px; overflow:hidden; aspect-ratio:4/3; }
   .tile video { width:100%; height:100%; object-fit:cover; display:block; }
   .tile .lbl { position:absolute; left:6px; bottom:6px; font-size:12px; background:rgba(0,0,0,.6); padding:2px 6px; border-radius:6px; }
-  .tile.call { outline:2px solid var(--red); }
+  .tile.call { outline:2px solid var(--red); cursor:pointer; }
+  .tile.call::after { content:'click to listen in'; position:absolute; right:6px; top:6px; font-size:11px; background:rgba(0,0,0,.65); padding:2px 6px; border-radius:6px; color:#fff; }
+  .tile.listening { outline:3px solid var(--blue); }
+  .tile.listening::after { content:'listening · click to leave'; background:var(--blue); }
+  .tile.me.call::after { content:'on a call'; }
+  .tile .mute { position:absolute; left:6px; top:6px; font-size:14px; background:rgba(0,0,0,.65); padding:2px 5px; border-radius:6px; display:none; }
+  .tile.muted .mute { display:block; }
+  .pill.muted { background:#3a2f1f; color:var(--amber); }
   .tile.me video { transform:scaleX(-1); }
   #app.compact { display:flex; flex-direction:column; padding:8px; max-width:none; }
   #app.compact h1, #app.compact #who, #app.compact #setup, #app.compact #meStatus, #app.compact #ctrlRow, #app.compact #log { display:none; }
@@ -79,10 +86,10 @@
   </div>
 
   <div class="card hidden" id="listenCard">
-    <div>You are listening to <b id="listenName"></b>. You hear both sides.</div>
+    <div>You are listening to <b id="listenName"></b>. You hear both sides. Click their tile again or press Back to leave.</div>
     <div style="margin-top:8px; display:flex; gap:8px">
       <button class="whisper" id="whisperBtn">Hold to whisper <kbd>W</kbd></button>
-      <button class="small" id="stopListen">Stop listening</button>
+      <button class="small" id="stopListen">Back to the floor</button>
     </div>
     <div class="status">Hold the button or the W key to talk into their ear. Only they hear you, never the prospect. Use the chat box below to send them a private note instead.</div>
   </div>
@@ -218,7 +225,8 @@
 
   function tileFor(identity, name) {
     let t = app.querySelector(`#tiles .tile[data-id="${identity}"]`);
-    if (!t) { t = document.createElement('div'); t.className = 'tile'; t.dataset.id = identity; t.innerHTML = '<span class="lbl"></span>'; $('tiles').appendChild(t); }
+    if (!t) { t = document.createElement('div'); t.className = 'tile'; t.dataset.id = identity; t.innerHTML = '<span class="lbl"></span><span class="mute" title="Mic muted">🔇</span>';
+      t.onclick = () => { if (identity === myId) return; const p = remote(identity); if (!p) return; if (listening === identity) listenTo(null); else if ((p.attributes || {}).state === 'call') listenTo(identity); }; $('tiles').appendChild(t); }
     t.querySelector('.lbl').textContent = name;
     return t;
   }
@@ -236,7 +244,7 @@
     const me = document.createElement('div');
     const listenersOfMe = people.filter(p => (p.attributes || {}).listening === myId).map(p => p.name || p.identity);
     me.className = 'row';
-    me.innerHTML = `<div><span class="name">${myName} (you)</span> <span class="pill ${state}">${state === 'call' ? 'On a call' : 'On the floor'}</span>
+    me.innerHTML = `<div><span class="name">${myName} (you)</span> <span class="pill ${state}">${state === 'call' ? 'On a call' : 'On the floor'}</span>${micMuted ? ' <span class="pill muted">🔇 muted</span>' : ''}
       <div class="dim">${listenersOfMe.length ? 'Listening to you: ' + listenersOfMe.join(', ') : 'Nobody listening'}</div></div>`;
     box.appendChild(me);
     if (!people.length) { const d = document.createElement('div'); d.className = 'dim'; d.style.padding = '8px 0'; d.textContent = 'Nobody else here yet.'; box.appendChild(d); }
@@ -246,17 +254,24 @@
       const row = document.createElement('div');
       row.className = 'row';
       const isL = listening === p.identity;
-      row.innerHTML = `<div><span class="name">${p.name || p.identity}</span> <span class="pill ${st}">${st === 'call' ? 'On a call' : 'On the floor'}</span>
+      row.innerHTML = `<div><span class="name">${p.name || p.identity}</span> <span class="pill ${st}">${st === 'call' ? 'On a call' : 'On the floor'}</span>${at.mic === 'muted' ? ' <span class="pill muted">🔇 muted</span>' : ''}
         ${at.listening ? `<div class="dim">listening to ${(remote(at.listening)?.name) || (at.listening === myId ? 'you' : at.listening)}</div>` : ''}</div>
         <button class="small ${isL ? 'call' : 'primary'}" ${st !== 'call' && !isL ? 'disabled' : ''}>${isL ? 'Stop' : 'Listen in'}</button>`;
       row.querySelector('button').onclick = () => listenTo(isL ? null : p.identity);
       box.appendChild(row);
     }
-    for (const p of people) { const t = app.querySelector(`#tiles .tile[data-id="${p.identity}"]`); if (t) t.classList.toggle('call', (p.attributes || {}).state === 'call'); }
-    app.querySelector(`#tiles .tile[data-id="${myId}"]`)?.classList.toggle('call', state === 'call');
+    for (const p of people) {
+      const t = app.querySelector(`#tiles .tile[data-id="${p.identity}"]`); if (!t) continue;
+      const at2 = p.attributes || {};
+      t.classList.toggle('call', at2.state === 'call'); t.classList.toggle('listening', listening === p.identity); t.classList.toggle('muted', at2.mic === 'muted');
+    }
+    const mine = app.querySelector(`#tiles .tile[data-id="${myId}"]`);
+    if (mine) { mine.classList.toggle('call', state === 'call'); mine.classList.toggle('muted', micMuted); }
     $('listenCard').classList.toggle('hidden', !listening);
     if (listening) $('listenName').textContent = remote(listening)?.name || listening;
   }
+
+  function pushAttrs() { return room.localParticipant.setAttributes({ state, listening: listening || '', mic: micMuted ? 'muted' : '' }); }
 
   async function setState(next) {
     if (next === state) return;
@@ -274,14 +289,14 @@
       $('toggle').className = 'big floor';
       $('meStatus').textContent = 'You are on the floor. Others can hear you.';
     }
-    await room.localParticipant.setAttributes({ state, listening: listening || '' });
+    await pushAttrs();
     applySubscriptions();
     render();
   }
 
   async function listenTo(identity) {
     listening = identity; updateChatTo();
-    await room.localParticipant.setAttributes({ state, listening: listening || '' });
+    await pushAttrs();
     applySubscriptions();
     render();
   }
@@ -289,7 +304,9 @@
   async function setMic(muted) {
     micMuted = muted;
     if (state === 'floor') { muted ? await voicePub?.mute() : await voicePub?.unmute(); }
-    $('micBtn').innerHTML = muted ? 'Unmute mic <kbd>M</kbd>' : 'Mute mic <kbd>M</kbd>';
+    $('micBtn').innerHTML = muted ? '🔇 Unmute mic <kbd>M</kbd>' : 'Mute mic <kbd>M</kbd>';
+    try { await pushAttrs(); } catch (e) {}
+    render();
   }
 
   async function setCam(off) {
@@ -413,7 +430,7 @@
       camPub = await room.localParticipant.publishTrack(cam, { name: 'cam', source: Track.Source.Camera, simulcast: false, videoEncoding: { maxBitrate: 250000, maxFramerate: 15 } });
       attachVideo(cam, myId, myName + ' (you)'); tileFor(myId, myName + ' (you)').classList.add('me');
     } catch (e) { $('camBtn').disabled = true; $('camBtn').textContent = 'No camera'; }
-    await room.localParticipant.setAttributes({ state: 'floor', listening: '' });
+    await pushAttrs();
     $('who').innerHTML = `You are ${myName}. Room: floor. <a href="#" id="switch">Not you?</a>`;
     $('switch').onclick = (e) => { e.preventDefault(); try { localStorage.removeItem('dialroom'); } catch (x) {} location.hash = ''; location.reload(); };
     applySubscriptions(); render();
