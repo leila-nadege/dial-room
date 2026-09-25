@@ -162,6 +162,15 @@
     });
   }
 
+  // a saved pass only works while its owner is still an active member (someone set inactive is out at once)
+  if (token) {
+    try {
+      const c = JSON.parse(atob(token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/')));
+      const r = await fetch(DESK, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: c.sub, check: true }) });
+      const d = await r.json();
+      if (r.ok && d.active === false) { token = null; url = null; localStorage.removeItem('dialroom'); }
+    } catch (e) {} // desk unreachable: keep the saved pass, LiveKit still decides
+  }
   if (!token || !url) {
     const got = await login();
     token = got.token; url = got.url;
