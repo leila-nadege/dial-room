@@ -60,6 +60,14 @@
   #app.compact #chatMsgs { max-height:80px; }
   .whisper { background:#3b2a5a; }
   .whisper.on { background:#8a4dff; }
+  #chatTabs { display:flex; gap:6px; margin-bottom:8px; }
+  #chatTabs button { position:relative; flex:1; background:#20242e; color:var(--dim); }
+  #chatTabs button.on { background:#2b3140; color:#fff; outline:1px solid var(--line); }
+  #chatTabs button:disabled { opacity:.4; }
+  .badge { display:none; min-width:18px; height:18px; line-height:18px; padding:0 5px; margin-left:6px; border-radius:99px; background:var(--red); color:#fff; font-size:11px; font-weight:700; text-align:center; vertical-align:middle; }
+  .badge.on { display:inline-block; }
+  #chatMsgs .empty { color:var(--dim); }
+  #chatNudge { display:block; width:100%; margin-top:8px; background:#3a1f22; color:#fff; font-weight:600; }
 </style>
 </head>
 <body>
@@ -75,6 +83,7 @@
 
   <div class="card" id="callCard">
     <button class="big floor" id="toggle">I'm connected to a call &nbsp;<kbd>C</kbd></button>
+    <button class="small hidden" id="chatNudge" title="Open the chat"></button>
     <div class="status" id="meStatus">You are on the floor. Others can hear you.</div>
     <div class="status" id="ctrlRow"><button class="small" id="micBtn">Mute mic <kbd>M</kbd></button> <button class="small" id="camBtn">Camera off <kbd>V</kbd></button> <button class="small" id="popBtn">Pop out</button></div>
   </div>
@@ -91,13 +100,16 @@
       <button class="whisper" id="whisperBtn">Hold to whisper <kbd>W</kbd></button>
       <button class="small" id="stopListen">Back to the floor</button>
     </div>
-    <div class="status">Hold the button or the W key to talk into their ear. Only they hear you, never the prospect. Use the chat box below to send them a private note instead.</div>
+    <div class="status">Hold the button or the W key to talk into their ear. Only they and anyone else listening to this call hear you: never the prospect, never the rest of the floor. Or type in the Call chat below.</div>
   </div>
 
   <div class="card" id="chatCard">
+    <div id="chatTabs">
+      <button class="small on" id="tabFloor" title="Everyone on the floor sees this">Floor chat<span class="badge" id="badgeFloor"></span></button>
+      <button class="small" id="tabCall" title="Only the caller and the people listening to that call see this" disabled>Call chat<span class="badge" id="badgeCall"></span></button>
+    </div>
     <div id="chatMsgs"></div>
     <div style="display:flex; gap:6px; margin-top:6px">
-      <button class="small" id="chatTo" title="Who sees this message">Floor</button>
       <input id="chatIn" placeholder="Message the floor" autocomplete="off">
     </div>
   </div>
@@ -188,6 +200,7 @@
   let micMuted = false;
   let ac, micStream, mixDest, tabTrack = null;
   let voicePub, callPub, whisperPub, camPub, camOff = false;
+  let whisperOn = false;         // I am holding whisper (my floor mic is cut while I do)
   const audioEls = new Map();    // trackSid -> element
   const enc = new TextEncoder(), dec = new TextDecoder();
 
@@ -224,10 +237,19 @@
   function pubOf(p, name) { for (const pub of p.trackPublications.values()) if (pub.trackName === name) return pub; return null; }
   function sub(p, name, on) { const pub = pubOf(p, name); if (pub && pub.isSubscribed !== on) pub.setSubscribed(on); }
 
+  // A whisper is heard by the person on the call and by everyone else listening to that same call, and by nobody else.
+  // Who is whispering into which call is an attribute on the whisperer (whisper = the caller's identity), so anyone who
+  // starts listening halfway through still hears it, and nobody has to be told by a message that could get lost.
+  function hearsWhisperOf(p) {
+    const into = (p.attributes || {}).whisper;
+    return !!into && (into === myId || into === listening);
+  }
+
   function applySubscriptions() {
     for (const p of room.remoteParticipants.values()) {
       sub(p, 'voice', state === 'floor');
       sub(p, 'call', listening === p.identity);
+      sub(p, 'whisper', hearsWhisperOf(p));
       sub(p, 'cam', true);
     }
   }
@@ -268,7 +290,9 @@
       box.appendChild(row);
     }
     for (const p of people) {
-      const t = app.querySelector(`#tiles .tile[data-id="${p.identity}"]`); if (!t) continue;
+      // everyone gets a tile, camera or not: the tile is the only way to listen in, so a caller with no camera
+      // (blocked, unplugged, or a laptop without one) used to be impossible to listen to
+      const t = tileFor(p.identity, p.name || p.identity);
       const at2 = p.attributes || {};
       t.classList.toggle('call', at2.state === 'call'); t.classList.toggle('listening', listening === p.identity); t.classList.toggle('muted', at2.mic === 'muted');
     }
@@ -278,7 +302,7 @@
     if (listening) $('listenName').textContent = remote(listening)?.name || listening;
   }
 
-  function pushAttrs() { return room.localParticipant.setAttributes({ state, listening: listening || '', mic: micMuted ? 'muted' : '' }); }
+  function pushAttrs() { return room.localParticipant.setAttributes({ state, listening: listening || '', mic: micMuted ? 'muted' : '', whisper: whisperOn && listening ? listening : '' }); }
 
   async function setState(next) {
     if (next === state) return;
@@ -296,13 +320,15 @@
       $('toggle').className = 'big floor';
       $('meStatus').textContent = 'You are on the floor. Others can hear you.';
     }
+    syncChat();
     await pushAttrs();
     applySubscriptions();
     render();
   }
 
   async function listenTo(identity) {
-    listening = identity; updateChatTo();
+    if (whisperOn) await whisper(false);   // never carry an open whisper from one call to the next
+    listening = identity; syncChat();
     await pushAttrs();
     applySubscriptions();
     render();
@@ -310,7 +336,7 @@
 
   async function setMic(muted) {
     micMuted = muted;
-    if (state === 'floor') { muted ? await voicePub?.mute() : await voicePub?.unmute(); }
+    if (state === 'floor' && !whisperOn) { muted ? await voicePub?.mute() : await voicePub?.unmute(); }
     $('micBtn').innerHTML = muted ? '🔇 Unmute mic <kbd>M</kbd>' : 'Mute mic <kbd>M</kbd>';
     try { await pushAttrs(); } catch (e) {}
     render();
@@ -322,33 +348,78 @@
     $('camBtn').innerHTML = off ? 'Camera on <kbd>V</kbd>' : 'Camera off <kbd>V</kbd>';
   }
 
-  let whisperOn = false;
+  // Holding whisper: my floor mic is cut FIRST (that was the leak: the whisperer is still on the floor, so the floor
+  // heard every whisper through the normal floor mic), then the whisper track opens for that call only.
   async function whisper(on) {
-    if (!listening || whisperOn === on) return;
+    if ((on && !listening) || whisperOn === on) return;
     whisperOn = on;
     $('whisperBtn').classList.toggle('on', on);
-    on ? await whisperPub?.unmute() : await whisperPub?.mute();
-    room.localParticipant.publishData(enc.encode(JSON.stringify({ t: 'whisper', on })), { reliable: true, destinationIdentities: [listening] });
+    try {
+      if (on) { await voicePub?.mute(); await whisperPub?.unmute(); }
+      else { await whisperPub?.mute(); if (state === 'floor' && !micMuted) await voicePub?.unmute(); }
+      await pushAttrs();
+    } catch (e) {}
   }
 
-  // ---- chat ----
-  let chatPrivate = false;
-  function addMsg(from, text, pm) {
-    const box = $('chatMsgs'); const d = document.createElement('div');
-    if (pm) d.className = 'pm';
-    d.innerHTML = `<span class="from">${from}${pm ? ' (private)' : ''}:</span> ${text.replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]))}`;
-    box.appendChild(d); while (box.children.length > 60) box.firstChild.remove(); box.scrollTop = box.scrollHeight;
+  // ---- chat: a floor chat everyone sees, and a call chat for one call (the caller plus whoever is listening to it).
+  // A message you have not looked at shows as a number on its tab. Nothing ever makes a sound.
+  const esc = (t) => String(t).replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]));
+  const chats = { floor: [] };       // 'floor' or the caller's identity -> [{from, text}]
+  const unread = { floor: 0, call: 0 };
+  let chatTab = 'floor';             // which tab is showing: 'floor' | 'call'
+  const callId = () => state === 'call' ? myId : listening;   // the call I am part of, if any
+  const callMembers = () => {        // everyone else in my call chat
+    const id = callId(); if (!id) return [];
+    const out = [...room.remoteParticipants.values()].filter(p => (p.attributes || {}).listening === id).map(p => p.identity);
+    if (id !== myId) out.push(id);
+    return [...new Set(out)].filter(x => x !== myId);
+  };
+  function drawChat() {
+    const id = callId();
+    $('tabFloor').classList.toggle('on', chatTab === 'floor');
+    $('tabCall').classList.toggle('on', chatTab === 'call');
+    $('tabCall').disabled = !id && !unread.call;
+    for (const k of ['floor', 'call']) { const b = $(k === 'floor' ? 'badgeFloor' : 'badgeCall'); b.textContent = unread[k] > 99 ? '99+' : unread[k]; b.classList.toggle('on', unread[k] > 0); }
+    // the same counts right under the call button (the chat itself may be scrolled out of sight) and in the tab title; silent
+    const total = unread.floor + unread.call;
+    $('chatNudge').classList.toggle('hidden', !total);
+    $('chatNudge').textContent = '💬 ' + [unread.call ? unread.call + ' new on the call' : '', unread.floor ? unread.floor + ' new on the floor' : ''].filter(Boolean).join(' · ');
+    document.title = (total ? '(' + total + ') ' : '') + 'Dial Room';
+    const who = id ? (id === myId ? 'your call' : (remote(id)?.name || id) + "'s call") : '';
+    $('chatIn').disabled = chatTab === 'call' && !id;
+    $('chatIn').placeholder = chatTab === 'floor' ? 'Message the floor' : id ? 'Message ' + who + ' (caller and listeners only)' : 'Join a call to use the call chat';
+    const msgs = chatTab === 'floor' ? chats.floor : (chats[id] || []);
+    const box = $('chatMsgs');
+    box.innerHTML = msgs.length ? msgs.map(m => `<div><span class="from">${esc(m.from)}:</span> ${esc(m.text)}</div>`).join('')
+      : `<div class="empty">${chatTab === 'floor' ? 'No floor messages yet.' : id ? 'No messages on ' + esc(who) + ' yet.' : 'Join a call to use the call chat.'}</div>`;
+    box.scrollTop = box.scrollHeight;
   }
-  function updateChatTo() {
-    if (!listening) chatPrivate = false;
-    $('chatTo').textContent = chatPrivate ? 'Only ' + (remote(listening)?.name || listening) : 'Floor';
-    $('chatIn').placeholder = chatPrivate ? 'Private note to ' + (remote(listening)?.name || listening) : 'Message the floor';
+  function showTab(tab) { chatTab = tab; unread[tab] = 0; drawChat(); }
+  function syncChat() {              // my call changed (started, ended, or I began or stopped listening)
+    if (!callId()) { unread.call = 0; if (chatTab === 'call') chatTab = 'floor'; }
+    drawChat();
+  }
+  function addMsg(channel, from, text, mine) {
+    const key = channel === 'floor' ? 'floor' : channel;
+    (chats[key] = chats[key] || []).push({ from, text }); if (chats[key].length > 80) chats[key].shift();
+    const tab = channel === 'floor' ? 'floor' : 'call';
+    if (tab === 'call' && channel !== callId()) return;          // a call I am no longer part of
+    const looking = chatTab === tab && app.ownerDocument.hasFocus();
+    if (!mine && !looking) unread[tab]++;
+    drawChat();
   }
   function sendChat() {
     const text = $('chatIn').value.trim(); if (!text) return;
-    const to = chatPrivate && listening ? listening : null;
-    room.localParticipant.publishData(enc.encode(JSON.stringify({ t: 'chat', text, pm: !!to })), { reliable: true, ...(to ? { destinationIdentities: [to] } : {}) });
-    addMsg('you', text, !!to); $('chatIn').value = '';
+    if (chatTab === 'call') {
+      const id = callId(); if (!id) return;
+      const to = callMembers();
+      if (to.length) room.localParticipant.publishData(enc.encode(JSON.stringify({ t: 'chat', ch: 'call', call: id, text })), { reliable: true, destinationIdentities: to });
+      addMsg(id, 'you', text, true);
+    } else {
+      room.localParticipant.publishData(enc.encode(JSON.stringify({ t: 'chat', ch: 'floor', text })), { reliable: true });
+      addMsg('floor', 'you', text, true);
+    }
+    $('chatIn').value = '';
   }
 
   // ---- events ----
@@ -360,17 +431,22 @@
   });
   room.on(RoomEvent.TrackUnsubscribed, (track, pub, p) => {
     track.detach().forEach(e => e.remove()); audioEls.delete(pub.trackSid);
-    if (track.kind === Track.Kind.Video) removeTile(p.identity);
+    if (track.kind === Track.Kind.Video) app.querySelector(`#tiles .tile[data-id="${p.identity}"] video`)?.remove();   // the tile stays (it is how you listen in); only the picture goes
   });
   room.on(RoomEvent.TrackPublished, () => { applySubscriptions(); render(); });
   room.on(RoomEvent.ParticipantConnected, () => { applySubscriptions(); render(); });
-  room.on(RoomEvent.ParticipantDisconnected, (p) => { if (listening === p.identity) { listening = null; updateChatTo(); } removeTile(p.identity); applySubscriptions(); render(); });
-  room.on(RoomEvent.ParticipantAttributesChanged, () => render());
+  room.on(RoomEvent.ParticipantDisconnected, (p) => { if (listening === p.identity) { listening = null; whisperOn = false; $('whisperBtn').classList.remove('on'); whisperPub?.mute(); if (state === 'floor' && !micMuted) voicePub?.unmute(); pushAttrs().catch(() => {}); syncChat(); } removeTile(p.identity); applySubscriptions(); render(); });
+  room.on(RoomEvent.ParticipantAttributesChanged, (changed, p) => {
+    applySubscriptions(); render(); drawChat();   // subscriptions too: a whisper starts and stops as an attribute
+  });
   room.on(RoomEvent.DataReceived, (payload, p) => {
     try {
       const m = JSON.parse(dec.decode(payload));
-      if (m.t === 'whisper' && p) sub(p, 'whisper', !!m.on);
-      if (m.t === 'chat' && p) addMsg(p.name || p.identity, String(m.text || ''), !!m.pm);
+      if (m.t === 'chat' && p) {
+        if (m.ch === 'call' && m.call) addMsg(String(m.call), p.name || p.identity, String(m.text || ''));
+        else if (m.pm) addMsg(state === 'call' ? myId : p.identity, p.name || p.identity, String(m.text || ''));   // a private note from an older copy of this page
+        else addMsg('floor', p.name || p.identity, String(m.text || ''));
+      }
     } catch (e) {}
   });
   room.on(RoomEvent.Disconnected, () => { $('who').textContent = 'Disconnected. Reload to rejoin.'; });
@@ -398,7 +474,11 @@
   $('camBtn').onclick = () => setCam(!camOff);
   $('shareBtn').onclick = shareTab;
   $('stopListen').onclick = () => listenTo(null);
-  $('chatTo').onclick = () => { if (listening) { chatPrivate = !chatPrivate; updateChatTo(); } };
+  $('chatNudge').onclick = () => { showTab(unread.call ? 'call' : 'floor'); $('chatCard').scrollIntoView({ block: 'nearest' }); $('chatIn').focus(); };
+  $('tabFloor').onclick = () => showTab('floor');
+  $('tabCall').onclick = () => showTab('call');
+  $('chatCard').addEventListener('click', () => { if (unread[chatTab]) { unread[chatTab] = 0; drawChat(); } });
+  $('chatIn').addEventListener('focus', () => { if (unread[chatTab]) { unread[chatTab] = 0; drawChat(); } });
   const wb = $('whisperBtn');
   wb.onmousedown = () => whisper(true); wb.onmouseup = wb.onmouseleave = () => whisper(false);
 
@@ -440,7 +520,7 @@
     await pushAttrs();
     $('who').innerHTML = `You are ${myName}. Room: floor. <a href="#" id="switch">Not you?</a>`;
     $('switch').onclick = (e) => { e.preventDefault(); try { localStorage.removeItem('dialroom'); } catch (x) {} location.hash = ''; location.reload(); };
-    applySubscriptions(); render();
+    applySubscriptions(); render(); drawChat();
   } catch (e) {
     $('who').textContent = 'Could not connect: ' + (e && e.message ? e.message : e);
   }
