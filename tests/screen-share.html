@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Dial Room tests</title>
+<style>
+  body { font: 14px/1.5 -apple-system, system-ui, sans-serif; margin: 16px; background: #fff; color: #111; }
+  .pass { color: #0a7a3a; } .fail { color: #b00020; font-weight: 600; }
+  iframe { width: 460px; height: 700px; border: 1px solid #ccc; margin-top: 12px; }
+</style>
+</head>
+<body>
+<h1 id="summary">Running…</h1>
+<ol id="results"></ol>
+<iframe id="room" title="Dial Room under test"></iframe>
+<script>
+// Loads ../index.html with livekit-client swapped for tests/stand-in-room.js and checks screen sharing, including
+// the security cases: nobody receives a screen they did not choose to watch, and a shared screen never carries sound.
+// Serve the repo root over http (python3 -m http.server) and open /tests/screen-share.html; the title ends PASS or FAIL.
+// The page under test runs on an in-memory localStorage (stand-in-room.js), so a real saved pass is never touched.
+(async () => {
+  const results = document.getElementById('results');
+  let failed = 0;
+  const check = (name, ok, detail) => {
+    if (!ok) failed++;
+    const li = document.createElement('li'); li.className = ok ? 'pass' : 'fail';
+    li.textContent = (ok ? 'PASS ' : 'FAIL ') + name + (ok || detail === undefined ? '' : ' (got ' + JSON.stringify(detail) + ')');
+    results.appendChild(li);
+  };
+  const wait = (ms) => new Promise(r => setTimeout(r, ms));
+
+  const b64 = (o) => btoa(JSON.stringify(o)).replace(/=+$/, '').replace(/\+/g, '-').replace(/\//g, '_');
+  const token = b64({ alg: 'HS256' }) + '.' + b64({ sub: 'me', name: 'Me', exp: Math.floor(Date.now() / 1000) + 3600 }) + '.test';
+  const realPassBefore = localStorage.getItem('dialroom');
+  try {
+  const pass = 'u=' + encodeURIComponent('wss://stand-in') + '&t=' + token;
+  const page = await (await fetch('../index.html', { cache: 'no-store' })).text();
+  const cdn = /<script src="https:\/\/cdn\.jsdelivr\.net\/npm\/livekit-client@[^"]+"><\/script>/;
+  if (!cdn.test(page)) { check('index.html loads livekit-client from the pinned CDN URL', false); return; }
+  const frame = document.getElementById('room');
+  frame.srcdoc = page.replace(cdn, '<script>window.__testPass = ' + JSON.stringify(pass) + ';<\/script><script src="stand-in-room.js"><\/script>');
+  await new Promise(r => frame.onload = r);
+  await wait(500);
+
+  const w = frame.contentWindow, d = frame.contentDocument, R = w.__room;
+  const q = (s) => d.querySelector(s);
+  const hidden = (id) => d.getElementById(id).classList.contains('hidden');
+    R.addRemote('harry', 'Harry'); R.addRemote('rena', 'Rena');
+    R.publishScreen('harry');
+    await wait(100);
+    check('a sharer is marked on their tile', q('.tile[data-id=harry]').classList.contains('sharing'));
+    check('someone not sharing is not marked', !q('.tile[data-id=rena]').classList.contains('sharing'));
+    check('a screen is not received before anyone clicks Watch', R.screenOf('harry').isSubscribed === false);
+    check('the viewer is closed before Watch', hidden('screenCard'));
+
+    q('.tile[data-id=harry] .scr').click(); await wait(100);
+    check('Watch receives that screen', R.screenOf('harry').isSubscribed === true);
+    check('Watch opens the viewer with the picture', !hidden('screenCard') && !!q('#screenBox video'));
+    check('the room is told who I am watching', R.local.attrs.watching === 'harry', R.local.attrs.watching);
+    check('watching is not listening in', R.local.attrs.listening === '', R.local.attrs.listening);
+
+    R.publishScreen('rena'); await wait(50);
+    q('.tile[data-id=rena] .scr').click(); await wait(100);
+    check('switching to another screen drops the first one', R.screenOf('harry').isSubscribed === false && R.screenOf('rena').isSubscribed === true);
+    check('only one picture is shown', d.querySelectorAll('#screenBox video').length === 1);
+    d.getElementById('screenStop').click(); await wait(100);
+    check('Stop watching drops the screen and closes the viewer', R.screenOf('rena').isSubscribed === false && hidden('screenCard'));
+
+    q('.tile[data-id=harry] .scr').click(); await wait(100);
+    R.unpublishScreen('harry'); await wait(100);
+    check('the viewer closes when the sharer stops', hidden('screenCard') && !q('#screenBox video') && R.local.attrs.watching === '');
+    R.publishScreen('harry'); await wait(50);
+    q('.tile[data-id=rena] .scr').click(); await wait(100);
+    R.leave('rena'); await wait(100);
+    check('the viewer closes when the sharer leaves', hidden('screenCard') && R.local.attrs.watching === '');
+
+    R.setAttrs('harry', { state: 'call' }); await wait(50);
+    q('.tile[data-id=harry]').click(); await wait(100);
+    check('clicking a tile on a call still listens in, without watching', R.local.attrs.listening === 'harry' && R.local.attrs.watching === '');
+    q('.tile[data-id=harry] .scr').click(); await wait(100);
+    check('listening and watching work together', R.local.attrs.listening === 'harry' && R.local.attrs.watching === 'harry');
+    d.getElementById('stopListen').click(); d.getElementById('screenStop').click(); await wait(100);
+
+    const audioBefore = R.local.pubs.filter(p => p.source !== 'screen_share').length;
+    d.getElementById('screenBtn').click(); await wait(150);
+    const opts = R.picker.calls.at(-1);
+    const mine = R.local.pubs.find(p => p.trackName === 'screen');
+    check('my screen is asked for without sound', opts && opts.audio === false, opts);
+    check('the picker offers tabs and windows, not a whole monitor', opts && opts.monitorTypeSurfaces === 'exclude', opts);
+    check('my screen is published as a screen share', !!mine && mine.source === 'screen_share', mine && mine.source);
+    check('showing my screen adds no other track', R.local.pubs.filter(p => p.source !== 'screen_share').length === audioBefore);
+    check('I am told my screen is showing', d.getElementById('screenStatus').textContent.includes('Your screen is showing'));
+    R.setAttrs('harry', { state: 'floor', watching: 'me' }); await wait(50);
+    check('I see who is watching', d.getElementById('screenStatus').textContent.includes('Watching: Harry'));
+    d.getElementById('app').classList.add('compact');
+    check('in the pop-out, the stop button stays visible while sharing', w.getComputedStyle(d.getElementById('ctrlRow')).display !== 'none');
+    d.getElementById('app').classList.remove('compact');
+    const unpublishesBefore = R.local.unpublishCalls || 0;
+    mine.track.mediaStreamTrack.dispatchEvent(new Event('ended')); await wait(150);
+    check("Chrome's Stop sharing bar unpublishes and stops my screen", !R.local.pubs.some(p => p.trackName === 'screen') && mine.track.stopped);
+    check("the page does not unpublish a second time after Chrome's bar", (R.local.unpublishCalls || 0) === unpublishesBefore + 1, (R.local.unpublishCalls || 0) - unpublishesBefore);
+    d.getElementById('app').classList.add('compact');
+    check('in the pop-out, the controls hide again once sharing stops', w.getComputedStyle(d.getElementById('ctrlRow')).display === 'none');
+    d.getElementById('app').classList.remove('compact');
+    check('the button goes back after a stop', d.getElementById('screenBtn').textContent.includes('Show my screen'));
+
+    d.getElementById('screenBtn').click(); await wait(150);
+    const again = R.local.pubs.find(p => p.trackName === 'screen');
+    d.getElementById('screenBtn').click(); await wait(150);
+    check('the button stops my screen', !R.local.pubs.some(p => p.trackName === 'screen') && again.track.stopped);
+
+    const published = R.local.publishCount;
+    d.getElementById('screenBtn').click(); d.getElementById('screenBtn').click(); await wait(200);
+    check('a double click starts one share, not two', R.local.publishCount === published + 1 && R.local.pubs.filter(p => p.trackName === 'screen').length === 1, R.local.publishCount - published);
+    d.getElementById('screenBtn').click(); await wait(150);
+    check('and that one share stops', !R.local.pubs.some(p => p.trackName === 'screen'));
+
+    const stray = R.screenOf('harry');
+    stray.isSubscribed = true; R.room.emit('ts', stray.track, stray, R.room.remoteParticipants.get('harry')); await wait(50);
+    check('a screen that arrives without Watch is dropped, not shown', stray.isSubscribed === false && !q('#screenBox video'));
+
+    R.picker.endBeforePublish = true;
+    d.getElementById('screenBtn').click(); await wait(200);
+    check('a share stopped in Chrome before it was published is not left showing', !R.local.pubs.some(p => p.trackName === 'screen') && d.getElementById('screenBtn').textContent.includes('Show my screen'));
+
+    R.addRemote('x', '<img src=x onerror="window.__xss=1">'); await wait(100);
+    check('a name with HTML in it shows as text, not markup', !w.__xss && !d.querySelector('#people img'));
+    R.leave('x'); await wait(50);
+
+    const cancel = new Error('Permission denied'); cancel.name = 'NotAllowedError';
+    R.picker.next = cancel;
+    d.getElementById('screenBtn').click(); await wait(100);
+    check('closing the picker says cancelled', d.getElementById('screenStatus').textContent.includes('cancelled'));
+    R.picker.next = new Error('picker broke');
+    d.getElementById('screenBtn').click(); await wait(100);
+    check('a picker failure is shown with its reason', d.getElementById('screenStatus').textContent.includes('picker broke'));
+    R.local.failNextPublish = new Error('not allowed to publish screen_share');
+    d.getElementById('screenBtn').click(); await wait(150);
+    check('a pass without screen share says so and publishes nothing', d.getElementById('screenStatus').textContent.includes('pass desk') && !R.local.pubs.some(p => p.trackName === 'screen'));
+    check('the button is not left on after a refused publish', d.getElementById('screenBtn').textContent.includes('Show my screen'));
+  } catch (e) {
+    check('the run finished without an error', false, String(e && e.stack || e));
+  } finally {
+    check("the real saved pass is untouched", localStorage.getItem('dialroom') === realPassBefore);
+    finish();
+  }
+
+  function finish() {
+    const total = results.children.length;
+    document.getElementById('summary').textContent = failed ? failed + ' of ' + total + ' failed' : 'All ' + total + ' passed';
+    document.title = 'Dial Room tests: ' + (failed ? 'FAIL' : 'PASS');
+  }
+})();
+</script>
+</body>
+</html>

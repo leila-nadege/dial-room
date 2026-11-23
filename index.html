@@ -68,6 +68,17 @@
   .badge.on { display:inline-block; }
   #chatMsgs .empty { color:var(--dim); }
   #chatNudge { display:block; width:100%; margin-top:8px; background:#3a1f22; color:#fff; font-weight:600; }
+  /* screen share: a picture only, never sound; nobody receives it unless they click Watch */
+  button.screenOn { background:#1f6b45; }
+  .tile .scr { position:absolute; right:6px; bottom:6px; font-size:11px; background:#1f6b45; color:#fff; padding:2px 6px; border-radius:6px; display:none; cursor:pointer; }
+  .tile.sharing .scr { display:block; }
+  .tile.me .scr { cursor:default; }
+  .pill.sharing { background:#1f3a2a; color:var(--green); }
+  #screenCard video { width:100%; display:block; background:#000; border-radius:8px; max-height:70vh; object-fit:contain; }
+  #screenCard video:fullscreen { max-height:none; border-radius:0; }
+  #app.compact #screenStatus { display:none; }
+  /* in the pop-out, someone showing their screen keeps the stop button and the watcher line */
+  #app.compact.sharingScreen #ctrlRow, #app.compact.sharingScreen #screenStatus { display:block; }
 </style>
 </head>
 <body>
@@ -85,7 +96,16 @@
     <button class="big floor" id="toggle">I'm connected to a call &nbsp;<kbd>C</kbd></button>
     <button class="small hidden" id="chatNudge" title="Open the chat"></button>
     <div class="status" id="meStatus">You are on the floor. Others can hear you.</div>
-    <div class="status" id="ctrlRow"><button class="small" id="micBtn">Mute mic <kbd>M</kbd></button> <button class="small" id="camBtn">Camera off <kbd>V</kbd></button> <button class="small" id="popBtn">Pop out</button></div>
+    <div class="status" id="ctrlRow"><button class="small" id="micBtn">Mute mic <kbd>M</kbd></button> <button class="small" id="camBtn">Camera off <kbd>V</kbd></button> <button class="small" id="popBtn">Pop out</button> <button class="small" id="screenBtn" title="Show a tab or window to the room. Picture only, no sound.">🖥 Show my screen</button></div>
+    <div class="status hidden" id="screenStatus"></div>
+  </div>
+
+  <div class="card hidden" id="screenCard">
+    <div style="display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:8px">
+      <div>Watching <b id="screenName"></b>'s screen</div>
+      <div style="display:flex; gap:6px"><button class="small" id="screenFull">Full screen</button><button class="small" id="screenStop">Stop watching</button></div>
+    </div>
+    <div id="screenBox"><div class="dim" id="screenWait">Loading their screen…</div></div>
   </div>
 
   <div class="card">
@@ -201,6 +221,9 @@
   let ac, micStream, mixDest, tabTrack = null;
   let voicePub, callPub, whisperPub, camPub, camOff = false;
   let whisperOn = false;         // I am holding whisper (my floor mic is cut while I do)
+  let screenPub = null;          // my screen, while I am showing it
+  let screenStarting = false;    // the picker or the publish is in progress (a second click must not start a second share)
+  let watching = null;           // identity whose screen I am watching
   const audioEls = new Map();    // trackSid -> element
   const enc = new TextEncoder(), dec = new TextDecoder();
 
@@ -230,6 +253,76 @@
     }
   }
 
+  // Show my screen: separate from the Lemlist tab share above, which carries the call's sound. This one is a picture
+  // only (audio: false), so showing a screen can never put a prospect's voice, or anything else, on the floor. It goes
+  // into the same room as everyone's voice, so only people who got in with the PIN can see it, and only the ones who
+  // click Watch receive it. Chrome's own "Stop sharing" bar ends it too.
+  async function showScreen(on) {
+    if (!on) {
+      const pub = screenPub;
+      screenOff();
+      // stop the capture before unpublishing, so the picture is gone even if the unpublish call fails
+      if (pub?.track) { pub.track.stop(); await room.localParticipant.unpublishTrack(pub.track); }
+      await pushAttrs();
+      return;
+    }
+    if (screenPub || screenStarting) return;
+    screenStarting = true;
+    try {
+      let disp;
+      try {
+        disp = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: 10 }, audio: false, selfBrowserSurface: 'exclude', surfaceSwitching: 'include', preferCurrentTab: false, monitorTypeSurfaces: 'exclude' });
+      } catch (e) {
+        // Chrome throws NotAllowedError when the person closes the picker; anything else is a real failure to show
+        screenMsg(e && e.name === 'NotAllowedError' ? '<span class="warn">Screen share cancelled.</span>' : '<span class="bad">Could not open the screen picker: ' + esc(e && e.message ? e.message : e) + '</span>');
+        return;
+      }
+      const v = disp.getVideoTracks()[0];
+      if (!v) { screenMsg('<span class="bad">No picture came through. Try again.</span>'); return; }
+      v.contentHint = 'detail';   // keep text sharp (Lemlist is mostly text), at the cost of frame rate
+      let pub;
+      try {
+        const scrEnc = { maxBitrate: 1500000, maxFramerate: 10 };
+        pub = await room.localParticipant.publishTrack(v, { name: 'screen', source: Track.Source.ScreenShare, simulcast: false, videoEncoding: scrEnc, screenShareEncoding: scrEnc });
+      } catch (e) {
+        // shown rather than thrown: the person who clicked needs to know their screen is not showing, and why
+        v.stop();
+        screenMsg('<span class="bad">Could not show your screen: ' + esc(e && e.message ? e.message : e) + '. If this says not allowed, the pass desk needs screen share added to the pass.</span>');
+        return;
+      }
+      screenPub = pub;
+      // Chrome's Stop sharing bar: livekit-client unpublishes an ended screen share itself, so only the page's state resets
+      v.addEventListener('ended', () => { if (screenPub === pub) { screenOff(); pushAttrs().catch(roomError('Could not tell the room your screen stopped')); } });
+      // stopped in Chrome while the publish was still on its way: livekit-client never saw it end, so unpublish here
+      if (v.readyState === 'ended') { await showScreen(false); return; }
+      $('screenBtn').innerHTML = '🖥 Stop showing my screen'; $('screenBtn').classList.add('screenOn'); app.classList.add('sharingScreen');
+      render();
+      await pushAttrs();
+    } finally {
+      screenStarting = false;
+    }
+  }
+  function screenOff() {
+    screenPub = null;
+    $('screenBtn').innerHTML = '🖥 Show my screen'; $('screenBtn').classList.remove('screenOn'); app.classList.remove('sharingScreen');
+    render();
+  }
+  // for room calls started from a click or a room event, where there is no caller to hand the error to: show it
+  const roomError = (what) => (e) => log(what + ': ' + (e && e.message ? e.message : e), 'warn');
+  function screenMsg(html) { const el = $('screenStatus'); el.innerHTML = html; el.classList.toggle('hidden', !html); }
+
+  function watchScreen(identity) {
+    if (watching === identity) return;
+    if (watching) closeScreenView();
+    watching = identity;
+    pushAttrs().catch(roomError('Could not tell the room what you are watching')); applySubscriptions(); render();
+    if (identity) $('screenCard').scrollIntoView({ block: 'nearest' });
+  }
+  function closeScreenView() {
+    $('screenBox').querySelector('video')?.remove();
+    $('screenWait').classList.remove('hidden');
+  }
+
   // ---- room ----
   const room = new Room({ adaptiveStream: false, dynacast: false });
 
@@ -251,12 +344,14 @@
       sub(p, 'call', listening === p.identity);
       sub(p, 'whisper', hearsWhisperOf(p));
       sub(p, 'cam', true);
+      sub(p, 'screen', watching === p.identity);   // a screen is only sent to whoever chose to watch it
     }
   }
 
   function tileFor(identity, name) {
     let t = app.querySelector(`#tiles .tile[data-id="${identity}"]`);
-    if (!t) { t = document.createElement('div'); t.className = 'tile'; t.dataset.id = identity; t.innerHTML = '<span class="lbl"></span><span class="mute" title="Mic muted">🔇</span>';
+    if (!t) { t = document.createElement('div'); t.className = 'tile'; t.dataset.id = identity; t.innerHTML = '<span class="lbl"></span><span class="mute" title="Mic muted">🔇</span><span class="scr" title="Watch their screen">🖥 Watch screen</span>';
+      t.querySelector('.scr').onclick = (e) => { e.stopPropagation(); if (identity === myId) return; watchScreen(watching === identity ? null : identity); };
       t.onclick = () => { if (identity === myId) return; const p = remote(identity); if (!p) return; if (listening === identity) listenTo(null); else if ((p.attributes || {}).state === 'call') listenTo(identity); }; $('tiles').appendChild(t); }
     t.querySelector('.lbl').textContent = name;
     return t;
@@ -274,9 +369,12 @@
     const people = [...room.remoteParticipants.values()].sort((a, b) => (a.name || a.identity).localeCompare(b.name || b.identity));
     const me = document.createElement('div');
     const listenersOfMe = people.filter(p => (p.attributes || {}).listening === myId).map(p => p.name || p.identity);
+    const watchersOfMe = people.filter(p => (p.attributes || {}).watching === myId).map(p => p.name || p.identity);
+    if (screenPub) screenMsg('<span class="ok">Your screen is showing.</span> ' + (watchersOfMe.length ? 'Watching: ' + esc(watchersOfMe.join(', ')) : 'Nobody is watching yet.'));
+    else if ($('screenStatus').querySelector('.ok')) screenMsg('');
     me.className = 'row';
-    me.innerHTML = `<div><span class="name">${myName} (you)</span> <span class="pill ${state}">${state === 'call' ? 'On a call' : 'On the floor'}</span>${micMuted ? ' <span class="pill muted">🔇 muted</span>' : ''}
-      <div class="dim">${listenersOfMe.length ? 'Listening to you: ' + listenersOfMe.join(', ') : 'Nobody listening'}</div></div>`;
+    me.innerHTML = `<div><span class="name">${esc(myName)} (you)</span> <span class="pill ${state}">${state === 'call' ? 'On a call' : 'On the floor'}</span>${micMuted ? ' <span class="pill muted">🔇 muted</span>' : ''}${screenPub ? ' <span class="pill sharing">🖥 showing screen</span>' : ''}
+      <div class="dim">${listenersOfMe.length ? 'Listening to you: ' + esc(listenersOfMe.join(', ')) : 'Nobody listening'}</div></div>`;
     box.appendChild(me);
     if (!people.length) { const d = document.createElement('div'); d.className = 'dim'; d.style.padding = '8px 0'; d.textContent = 'Nobody else here yet.'; box.appendChild(d); }
     for (const p of people) {
@@ -285,8 +383,14 @@
       const row = document.createElement('div');
       row.className = 'row';
       const isL = listening === p.identity;
-      row.innerHTML = `<div><span class="name">${p.name || p.identity}</span> <span class="pill ${st}">${st === 'call' ? 'On a call' : 'On the floor'}</span>${at.mic === 'muted' ? ' <span class="pill muted">🔇 muted</span>' : ''}
-        ${at.listening ? `<div class="dim">listening to ${(remote(at.listening)?.name) || (at.listening === myId ? 'you' : at.listening)}</div>` : ''}${isL ? '<div class="dim" style="color:var(--blue)">you are listening to this call</div>' : ''}</div>`;
+      const shares = !!pubOf(p, 'screen');
+      row.innerHTML = `<div><span class="name">${esc(p.name || p.identity)}</span> <span class="pill ${st}">${st === 'call' ? 'On a call' : 'On the floor'}</span>${at.mic === 'muted' ? ' <span class="pill muted">🔇 muted</span>' : ''}${shares ? ' <span class="pill sharing">🖥 showing screen</span>' : ''}
+        ${at.listening ? `<div class="dim">listening to ${esc((remote(at.listening)?.name) || (at.listening === myId ? 'you' : at.listening))}</div>` : ''}${isL ? '<div class="dim" style="color:var(--blue)">you are listening to this call</div>' : ''}</div>`;
+      if (shares) {
+        const b = document.createElement('button'); b.className = 'small'; b.textContent = watching === p.identity ? 'Stop watching' : 'Watch screen';
+        b.onclick = () => watchScreen(watching === p.identity ? null : p.identity);
+        row.appendChild(b);
+      }
       box.appendChild(row);
     }
     for (const p of people) {
@@ -295,14 +399,19 @@
       const t = tileFor(p.identity, p.name || p.identity);
       const at2 = p.attributes || {};
       t.classList.toggle('call', at2.state === 'call'); t.classList.toggle('listening', listening === p.identity); t.classList.toggle('muted', at2.mic === 'muted');
+      t.classList.toggle('sharing', !!pubOf(p, 'screen'));
+      t.querySelector('.scr').textContent = watching === p.identity ? '🖥 Stop watching' : '🖥 Watch screen';
     }
     const mine = app.querySelector(`#tiles .tile[data-id="${myId}"]`);
-    if (mine) { mine.classList.toggle('call', state === 'call'); mine.classList.toggle('muted', micMuted); }
+    if (mine) { mine.classList.toggle('call', state === 'call'); mine.classList.toggle('muted', micMuted); mine.classList.toggle('sharing', !!screenPub); mine.querySelector('.scr').textContent = '🖥 You are showing'; }
+    if (watching && !remote(watching)) { watching = null; closeScreenView(); pushAttrs().catch(roomError('Could not tell the room what you are watching')); }
+    $('screenCard').classList.toggle('hidden', !watching);
+    if (watching) $('screenName').textContent = remote(watching)?.name || watching;
     $('listenCard').classList.toggle('hidden', !listening);
     if (listening) $('listenName').textContent = remote(listening)?.name || listening;
   }
 
-  function pushAttrs() { return room.localParticipant.setAttributes({ state, listening: listening || '', mic: micMuted ? 'muted' : '', whisper: whisperOn && listening ? listening : '' }); }
+  function pushAttrs() { return room.localParticipant.setAttributes({ state, listening: listening || '', mic: micMuted ? 'muted' : '', whisper: whisperOn && listening ? listening : '', watching: watching || '' }); }
 
   async function setState(next) {
     if (next === state) return;
@@ -424,6 +533,14 @@
 
   // ---- events ----
   room.on(RoomEvent.TrackSubscribed, (track, pub, p) => {
+    if (pub.trackName === 'screen') {
+      if (watching !== p.identity) { pub.setSubscribed(false); return; }
+      closeScreenView();
+      const v = track.attach(); v.muted = true; v.playsInline = true; v.title = 'Double-click for full screen';
+      v.ondblclick = () => v.requestFullscreen?.();
+      $('screenBox').appendChild(v); $('screenWait').classList.add('hidden');
+      return;
+    }
     if (track.kind === Track.Kind.Video) { attachVideo(track, p.identity, p.name || p.identity); render(); return; }
     if (track.kind !== Track.Kind.Audio) return;
     const el = track.attach();
@@ -431,9 +548,14 @@
   });
   room.on(RoomEvent.TrackUnsubscribed, (track, pub, p) => {
     track.detach().forEach(e => e.remove()); audioEls.delete(pub.trackSid);
+    if (pub.trackName === 'screen') { closeScreenView(); return; }
     if (track.kind === Track.Kind.Video) app.querySelector(`#tiles .tile[data-id="${p.identity}"] video`)?.remove();   // the tile stays (it is how you listen in); only the picture goes
   });
   room.on(RoomEvent.TrackPublished, () => { applySubscriptions(); render(); });
+  room.on(RoomEvent.TrackUnpublished, (pub, p) => {
+    if (pub.trackName === 'screen' && watching === p.identity) { watching = null; closeScreenView(); pushAttrs().catch(roomError('Could not tell the room what you are watching')); }
+    applySubscriptions(); render();
+  });
   room.on(RoomEvent.ParticipantConnected, () => { applySubscriptions(); render(); });
   room.on(RoomEvent.ParticipantDisconnected, (p) => { if (listening === p.identity) { listening = null; whisperOn = false; $('whisperBtn').classList.remove('on'); whisperPub?.mute(); if (state === 'floor' && !micMuted) voicePub?.unmute(); pushAttrs().catch(() => {}); syncChat(); } removeTile(p.identity); applySubscriptions(); render(); });
   room.on(RoomEvent.ParticipantAttributesChanged, (changed, p) => {
@@ -473,6 +595,9 @@
   $('micBtn').onclick = () => setMic(!micMuted);
   $('camBtn').onclick = () => setCam(!camOff);
   $('shareBtn').onclick = shareTab;
+  $('screenBtn').onclick = () => showScreen(!screenPub).catch(roomError('Screen share'));
+  $('screenStop').onclick = () => watchScreen(null);
+  $('screenFull').onclick = () => { const v = $('screenBox').querySelector('video'); if (v) v.requestFullscreen?.(); };
   $('stopListen').onclick = () => listenTo(null);
   $('chatNudge').onclick = () => { showTab(unread.call ? 'call' : 'floor'); $('chatCard').scrollIntoView({ block: 'nearest' }); $('chatIn').focus(); };
   $('tabFloor').onclick = () => showTab('floor');
