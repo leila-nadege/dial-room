@@ -17,6 +17,13 @@
     removeItem: (k) => { store.delete(k); }, clear: () => store.clear(),
   } });
 
+  // the page under test is always "visible" unless the test says otherwise (window.__room.hidden), so the checks do
+  // not depend on whether the test window itself is in front
+  // animation frames on a timer: a test window that is not in front gets almost no real frames, and the bursts
+  // would never finish
+  window.requestAnimationFrame = (cb) => setTimeout(() => cb(performance.now()), 16);
+  Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => (window.__room && window.__room.hidden ? 'hidden' : 'visible') });
+
   const picker = { calls: [], next: null, endBeforePublish: false, focus: [], refuseFocus: null };
   // Chrome's CaptureController: records the focus behaviour the page asks for; refuseFocus makes it throw that error
   window.CaptureController = class { setFocusBehavior(f) { if (picker.refuseFocus) { const e = picker.refuseFocus; picker.refuseFocus = null; throw e; } picker.focus.push(f); } };   // next: an Error the next getDisplayMedia call throws
@@ -52,7 +59,8 @@
         },
         async unpublishTrack(track) { this.unpublishCalls = (this.unpublishCalls || 0) + 1; this.pubs = this.pubs.filter(p => p.track !== track); },
         async setAttributes(a) { this.attrs = a; },
-        publishData() {},
+        sent: [],
+        async publishData(data, opts) { this.sent.push({ msg: JSON.parse(new TextDecoder().decode(data)), opts }); },
       };
       window.__room = {
         room, picker, local: this.localParticipant,
@@ -70,6 +78,7 @@
           if (pub.isSubscribed) { pub.isSubscribed = false; room.emit('tu', pub.track, pub, p); }
           p.trackPublications.delete(pub.trackSid); room.emit('tunp', pub, p);
         },
+        send(id, msg) { room.emit('dr', new TextEncoder().encode(JSON.stringify(msg)), room.remoteParticipants.get(id)); },
         setAttrs(id, a) { const p = room.remoteParticipants.get(id); p.attributes = a; room.emit('pac', a, p); },
         leave(id) { const p = room.remoteParticipants.get(id); room.remoteParticipants.delete(id); room.emit('pd', p); },
       };
