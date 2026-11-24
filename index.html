@@ -85,6 +85,12 @@
   #myScreen { margin-top:8px; }
   #myScreen video { width:100%; max-height:160px; display:block; background:#000; border-radius:8px; object-fit:contain; }
   #app.compact #myScreen video { max-height:90px; }
+  /* reactions: a burst drawn on the sender's tile, over their camera; never blocks a click on the tile */
+  #reactRow { display:flex; flex-wrap:wrap; gap:6px; }
+  #reactRow button { display:inline-flex; align-items:center; gap:4px; }
+  #reactRow svg { width:14px; height:15px; }
+  .tile canvas.fx { position:absolute; inset:0; width:100%; height:100%; pointer-events:none; }
+  #app.compact #reactRow .lbl { display:none; }
 </style>
 </head>
 <body>
@@ -104,6 +110,13 @@
     <div class="status" id="meStatus">You are on the floor. Others can hear you.</div>
     <div class="status" id="ctrlRow"><button class="small" id="micBtn">Mute mic <kbd>M</kbd></button> <button class="small" id="camBtn">Camera off <kbd>V</kbd></button> <button class="small" id="popBtn">Pop out</button> <button class="small" id="screenBtn" title="Show a tab or window to the room. Picture only, no sound.">🖥 Show my screen</button></div>
     <div class="status hidden" id="screenStatus"></div>
+    <div class="status" id="reactRow">
+      <button class="small" data-react="confetti" title="Celebrate: confetti on your tile, for everyone">🎉<span class="lbl"> Celebrate</span></button>
+      <button class="small" data-react="fire" title="On fire: flames rise up your tile, for everyone">🔥<span class="lbl"> On fire</span></button>
+      <button class="small" data-react="thumbs" title="Nice one: thumbs up on your tile, for everyone">👍<span class="lbl"> Nice one</span></button>
+      <button class="small" data-react="money" title="Money rain: notes fall down your tile, for everyone">💵<span class="lbl"> Money rain</span></button>
+      <button class="small" data-react="runner" title="Hell yeh: the UGOKI runner sprints across your tile, for everyone"><svg viewBox="0 0 750 810" aria-hidden="true"><path fill="#C8200A" d="M436 12 L468 17 L484 27 L494 38 L502 54 L506 88 L517 116 L515 123 L501 124 L498 143 L486 160 L468 168 L438 169 L436 195 L521 196 L587 280 L726 266 L733 268 L739 328 L739 342 L735 343 L553 367 L512 311 L509 308 L504 310 L489 432 L505 441 L605 476 L615 483 L659 712 L646 714 L576 708 L551 551 L539 542 L485 521 L521 596 L526 616 L478 796 L476 799 L466 799 L390 787 L439 622 L388 516 L388 674 L186 796 L162 715 L170 708 L304 636 L307 509 L302 511 L251 619 L242 626 L12 645 L26 565 L190 554 L251 436 L270 286 L229 297 L213 306 L191 438 L181 439 L119 413 L142 250 L279 196 L359 195 L364 183 L375 87 L384 49 L392 36 L406 23Z"/></svg><span class="lbl"> Hell yeh</span></button>
+    </div>
     <div class="hidden" id="myScreen"><div class="dim">What the room sees</div><video muted playsinline></video></div>
   </div>
 
@@ -597,13 +610,99 @@
         if (m.ch === 'call' && m.call) addMsg(String(m.call), p.name || p.identity, String(m.text || ''));
         else if (m.pm) addMsg(state === 'call' ? myId : p.identity, p.name || p.identity, String(m.text || ''));   // a private note from an older copy of this page
         else addMsg('floor', p.name || p.identity, String(m.text || ''));
-      }
+      } else if (m.t === 'react' && p) playReaction(p.identity, String(m.k));
     } catch (e) {}
   });
   // livekit-client stops every local track on disconnect without an 'ended' event, so the screen state is reset here
   room.on(RoomEvent.Disconnected, () => { $('who').textContent = 'Disconnected. Reload to rejoin.'; if (screenPub) screenOff(); });
   room.on(RoomEvent.Reconnecting, () => log('Reconnecting…', 'warn'));
   room.on(RoomEvent.Reconnected, () => log(''));
+
+  // ---- reactions: a burst on the sender's own tile, which everyone in the room sees there. No sound, ever. ----
+  // A reaction is one small data message ({t:'react', k}); each page draws it itself, so nothing heavy is sent.
+  const REACTIONS = new Set(['confetti', 'fire', 'thumbs', 'money', 'runner']);
+  const MAX_BUSY_TILES = 4;    // at most this many tiles animate at once, so a room celebrating together stays light
+  const REACT_GAP_MS = 1500;   // one reaction per person per 1.5 s: checked when sending, and again by every receiver
+  const lastReact = new Map(); // identity -> when a reaction last played on their tile
+  const RUNNER = new Path2D('M436 12 L468 17 L484 27 L494 38 L502 54 L506 88 L517 116 L515 123 L501 124 L498 143 L486 160 L468 168 L438 169 L436 195 L521 196 L587 280 L726 266 L733 268 L739 328 L739 342 L735 343 L553 367 L512 311 L509 308 L504 310 L489 432 L505 441 L605 476 L615 483 L659 712 L646 714 L576 708 L551 551 L539 542 L485 521 L521 596 L526 616 L478 796 L476 799 L466 799 L390 787 L439 622 L388 516 L388 674 L186 796 L162 715 L170 708 L304 636 L307 509 L302 511 L251 619 L242 626 L12 645 L26 565 L190 554 L251 436 L270 286 L229 297 L213 306 L191 438 L181 439 L119 413 L142 250 L279 196 L359 195 L364 183 L375 87 L384 49 L392 36 L406 23Z');   // the UGOKI runner (website runner-red.svg), in a 750 x 810 box
+  const EMOJI_FONT = '"Apple Color Emoji","Segoe UI Emoji","Noto Color Emoji",sans-serif';
+  const CONFETTI = ['#ff5a5f', '#2ecc71', '#4ea1ff', '#ffb347', '#c9a7ff', '#ffffff'];
+
+  function tileById(id) { return [...app.querySelectorAll('#tiles .tile')].find(t => t.dataset.id === id); }
+  function playReaction(identity, kind) {
+    if (!REACTIONS.has(kind)) return;
+    const now = Date.now();
+    if (now - (lastReact.get(identity) || 0) < REACT_GAP_MS) return;
+    const tile = tileById(identity);
+    if (!tile) return;
+    // a hidden page draws no frames, so the burst would wait and play late, out of date, when you come back: skip it
+    if (tile.ownerDocument.visibilityState === 'hidden') return;
+    const own = tile.querySelector('canvas.fx');
+    const busy = [...app.querySelectorAll('#tiles canvas.fx')].filter(c => c !== own && c.running && performance.now() - c.lastFrame < 500).length;
+    if (busy >= MAX_BUSY_TILES) return;
+    lastReact.set(identity, now);
+    burst(tile, kind);
+  }
+  function sendReaction(kind) {
+    if (!REACTIONS.has(kind) || Date.now() - (lastReact.get(myId) || 0) < REACT_GAP_MS) return;
+    playReaction(myId, kind);
+    lastReact.set(myId, Date.now());   // the cooldown holds even if my tile is not there to play on
+    room.localParticipant.publishData(enc.encode(JSON.stringify({ t: 'react', k: kind })), { reliable: true }).catch(roomError('Could not send the reaction'));
+  }
+
+  const rand = (a, b) => a + Math.random() * (b - a);
+  function particles(kind, w, h) {
+    const out = [];
+    if (kind === 'confetti') for (let i = 0; i < 110; i++) { const a = rand(0, 6.28), v = rand(2, 7) * w / 200; out.push({ k: kind, t: 0, life: 150, x: w / 2, y: h * .45, vx: Math.cos(a) * v, vy: Math.sin(a) * v - 2, r: rand(0, 6.28), vr: rand(-.3, .3), c: CONFETTI[i % CONFETTI.length], s: rand(w / 30, w / 18) }); }
+    if (kind === 'fire') for (let i = 0; i < 22; i++) out.push({ k: kind, t: -Math.floor(rand(0, 30)), life: 110, x: rand(.05, .95) * w, y: h + 10, vy: -rand(.8, 2) * h / 150, s: rand(.08, .15) * h });
+    if (kind === 'thumbs') for (let i = 0; i < 16; i++) out.push({ k: kind, t: -i * 3, life: 70, x: rand(.1, .9) * w, y: rand(.15, .85) * h, s: rand(.1, .2) * h });
+    if (kind === 'money') for (let i = 0; i < 16; i++) out.push({ k: kind, t: 0, life: 260, x: rand(0, w), y: -rand(0, h * .4), vy: rand(1.2, 2.2) * h / 150, ph: rand(0, 6.28), r: rand(-.4, .4), s: rand(.1, .14) * h });
+    if (kind === 'runner') {
+      out.push({ k: 'run', t: 0, life: 110, w, h });
+      for (let i = 0; i < 10; i++) out.push({ k: kind, t: -Math.floor(rand(10, 40)), life: 260, x: rand(0, w), y: -rand(10, h * .5), vx: rand(-.4, .4), vy: rand(1, 2) * h / 150, r: rand(0, 6.28), vr: rand(-.1, .1), s: rand(.1, .16) * h / 810 });
+    }
+    return out;
+  }
+  function burst(tile, kind) {
+    let cv = tile.querySelector('canvas.fx');
+    // under the name label and the badges, over the camera, so a burst never hides that someone is muted
+    if (!cv) { cv = tile.ownerDocument.createElement('canvas'); cv.className = 'fx'; tile.insertBefore(cv, tile.querySelector('.lbl')); }
+    // a loop whose window went away (the pop-out closed mid-burst) or that the browser paused (a hidden tab) has
+    // drawn nothing for a while: start a fresh one, and the generation number stops the old one if it ever resumes
+    const stale = cv.running && performance.now() - cv.lastFrame > 500;
+    if (!cv.running || stale) { cv.width = tile.clientWidth; cv.height = tile.clientHeight; cv.parts = []; }
+    cv.parts = cv.parts.concat(particles(kind, cv.width, cv.height)).slice(-300);
+    if (!cv.running || stale) { cv.running = true; cv.gen = (cv.gen || 0) + 1; frame(cv, cv.gen); }
+  }
+  function frame(cv, gen) {
+    if (gen !== cv.gen) return;
+    cv.lastFrame = performance.now();
+    const cx = cv.getContext('2d'), w = cv.width, h = cv.height;
+    cx.clearRect(0, 0, w, h);
+    for (const p of cv.parts) {
+      p.t++;
+      if (p.t < 0) continue;
+      const fade = Math.min(1, (p.life - p.t) / 20);
+      cx.save();
+      if (p.k === 'confetti') { p.vy += .08; p.vx *= .985; p.x += p.vx; p.y += p.vy; p.r += p.vr; cx.globalAlpha = fade; cx.translate(p.x, p.y); cx.rotate(p.r); cx.fillStyle = p.c; cx.fillRect(-p.s / 2, -p.s / 4, p.s, p.s / 2); }
+      else if (p.k === 'run') { const x = -h * .2 + (w + h * .4) * p.t / p.life, sc = h * .4 / 810; cx.translate(x, h * .55 + Math.sin(p.t / 2.5) * h * .02); cx.rotate(Math.sin(p.t / 2.5) * .06); cx.scale(sc, sc); cx.translate(-375, -405); cx.fillStyle = '#C8200A'; cx.fill(RUNNER); }
+      else if (p.k === 'runner') { p.x += p.vx; p.y += p.vy; p.r += p.vr; cx.translate(p.x, p.y); cx.rotate(p.r); cx.scale(p.s, p.s); cx.translate(-375, -405); cx.fillStyle = '#C8200A'; cx.fill(RUNNER); }
+      else {
+        let emoji, size = p.s;
+        if (p.k === 'fire') { emoji = '🔥'; p.y += p.vy; cx.globalAlpha = Math.max(0, 1 - p.t / p.life); }
+        if (p.k === 'thumbs') { emoji = '👍'; size = p.s * (p.t < 8 ? p.t / 8 * 1.15 : 1); p.y -= .3; cx.globalAlpha = fade; }
+        if (p.k === 'money') { emoji = '💵'; p.y += p.vy; p.x += Math.sin(p.t / 18 + p.ph) * .6; cx.globalAlpha = fade; }
+        cx.translate(p.x, p.y); if (p.r) cx.rotate(p.r);
+        cx.font = Math.round(size) + 'px ' + EMOJI_FONT; cx.textAlign = 'center'; cx.textBaseline = 'middle'; cx.fillText(emoji, 0, 0);
+      }
+      cx.restore();
+    }
+    cv.parts = cv.parts.filter(p => p.t < p.life && !(p.y > h + p.s * 900 && p.k === 'runner') && !(p.k !== 'runner' && p.k !== 'run' && p.y > h + 40));
+    // the tile's own window: in the pop-out the main tab is usually in the background, where its frames stop
+    const win = cv.ownerDocument.defaultView;
+    if (cv.parts.length && cv.isConnected && win) win.requestAnimationFrame(() => frame(cv, gen));
+    else { cv.running = false; cv.parts = []; cx.clearRect(0, 0, w, h); }
+  }
 
   // ---- keys ----
   function bindKeys(win) {
@@ -629,6 +728,7 @@
   $('screenStop').onclick = () => watchScreen(null);
   $('screenFull').onclick = () => { const v = $('screenBox').querySelector('video'); if (v) v.requestFullscreen?.(); };
   $('stopListen').onclick = () => listenTo(null);
+  app.querySelectorAll('#reactRow [data-react]').forEach(b => { b.onclick = () => sendReaction(b.dataset.react); });
   $('chatNudge').onclick = () => { showTab(unread.call ? 'call' : 'floor'); $('chatCard').scrollIntoView({ block: 'nearest' }); $('chatIn').focus(); };
   $('tabFloor').onclick = () => showTab('floor');
   $('tabCall').onclick = () => showTab('call');
@@ -676,6 +776,7 @@
       camPub = await room.localParticipant.publishTrack(cam, { name: 'cam', source: Track.Source.Camera, simulcast: false, videoEncoding: { maxBitrate: 250000, maxFramerate: 15 } });
       attachVideo(cam, myId, myName + ' (you)'); tileFor(myId, myName + ' (you)').classList.add('me');
     } catch (e) { $('camBtn').disabled = true; $('camBtn').textContent = 'No camera'; }
+    tileFor(myId, myName + ' (you)').classList.add('me');   // with or without a camera: reactions play on it
     await pushAttrs();
     $('who').innerHTML = `You are ${myName}. Room: floor. <a href="#" id="switch">Not you?</a>`;
     $('switch').onclick = (e) => { e.preventDefault(); try { localStorage.removeItem('dialroom'); } catch (x) {} location.hash = ''; location.reload(); };
