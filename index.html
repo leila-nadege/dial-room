@@ -76,9 +76,15 @@
   .pill.sharing { background:#1f3a2a; color:var(--green); }
   #screenCard video { width:100%; display:block; background:#000; border-radius:8px; max-height:70vh; object-fit:contain; }
   #screenCard video:fullscreen { max-height:none; border-radius:0; }
-  #app.compact #screenStatus { display:none; }
-  /* in the pop-out, someone showing their screen keeps the stop button and the watcher line */
-  #app.compact.sharingScreen #ctrlRow, #app.compact.sharingScreen #screenStatus { display:block; }
+  /* while sharing, the pop-out keeps the stop button and the status line, but no other controls. A share is never
+     started from the pop-out: Chrome could offer the pop-out window itself in the picker, and sharing it would show
+     the Call chat to everyone watching. Start in the Dial Room tab (it stays in front), then pop out. */
+  #app.compact.sharingScreen #ctrlRow { display:block; }
+  #app.compact #ctrlRow button:not(#screenBtn) { display:none; }
+  /* a small copy of my own shared screen, so I can see what the room sees without leaving the Dial Room */
+  #myScreen { margin-top:8px; }
+  #myScreen video { width:100%; max-height:160px; display:block; background:#000; border-radius:8px; object-fit:contain; }
+  #app.compact #myScreen video { max-height:90px; }
 </style>
 </head>
 <body>
@@ -98,6 +104,7 @@
     <div class="status" id="meStatus">You are on the floor. Others can hear you.</div>
     <div class="status" id="ctrlRow"><button class="small" id="micBtn">Mute mic <kbd>M</kbd></button> <button class="small" id="camBtn">Camera off <kbd>V</kbd></button> <button class="small" id="popBtn">Pop out</button> <button class="small" id="screenBtn" title="Show a tab or window to the room. Picture only, no sound.">🖥 Show my screen</button></div>
     <div class="status hidden" id="screenStatus"></div>
+    <div class="hidden" id="myScreen"><div class="dim">What the room sees</div><video muted playsinline></video></div>
   </div>
 
   <div class="card hidden" id="screenCard">
@@ -270,13 +277,19 @@
     screenStarting = true;
     try {
       let disp;
+      // Chrome switches to the tab or window you pick unless told otherwise (CaptureController, Chrome 109+); the
+      // person sharing wants to stay where they can see the room, and can go to the shared tab themselves
+      const controller = 'CaptureController' in window ? new CaptureController() : null;
       try {
-        disp = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: 10 }, audio: false, selfBrowserSurface: 'exclude', surfaceSwitching: 'include', preferCurrentTab: false, monitorTypeSurfaces: 'exclude' });
+        disp = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: 10 }, audio: false, selfBrowserSurface: 'exclude', surfaceSwitching: 'include', preferCurrentTab: false, monitorTypeSurfaces: 'exclude', ...(controller ? { controller } : {}) });
       } catch (e) {
         // Chrome throws NotAllowedError when the person closes the picker; anything else is a real failure to show
         screenMsg(e && e.name === 'NotAllowedError' ? '<span class="warn">Screen share cancelled.</span>' : '<span class="bad">Could not open the screen picker: ' + esc(e && e.message ? e.message : e) + '</span>');
         return;
       }
+      // must run straight after the picker, before anything else is awaited, or Chrome has already switched; outside
+      // the picker's try, so nothing it does can be mistaken for a failed picker and leave the capture untracked
+      if (controller) keepFocus(controller);
       const v = disp.getVideoTracks()[0];
       if (!v) { screenMsg('<span class="bad">No picture came through. Try again.</span>'); return; }
       v.contentHint = 'detail';   // keep text sharp (Lemlist is mostly text), at the cost of frame rate
@@ -296,13 +309,29 @@
       // stopped in Chrome while the publish was still on its way: livekit-client never saw it end, so unpublish here
       if (v.readyState === 'ended') { await showScreen(false); return; }
       $('screenBtn').innerHTML = '🖥 Stop showing my screen'; $('screenBtn').classList.add('screenOn'); app.classList.add('sharingScreen');
+      showMyScreen(v);
       render();
       await pushAttrs();
     } finally {
       screenStarting = false;
     }
   }
+  function keepFocus(controller) {
+    // caught, not thrown: staying in the room is a nicety, and the share is already running. Chrome refuses it for
+    // some surfaces (InvalidStateError), which only means it switches to the shared tab as it did before; anything
+    // else is noted on the status line
+    try { controller.setFocusBehavior('no-focus-change'); } catch (e) { if (!(e && e.name === 'InvalidStateError')) roomError('Could not keep you in the Dial Room')(e); }
+  }
+  function showMyScreen(track) {
+    const v = $('myScreen').querySelector('video');
+    v.srcObject = track ? new MediaStream([track]) : null;
+    $('myScreen').classList.toggle('hidden', !track);
+    if (track) playPreview(v);
+  }
+  // AbortError is play() being cut short because the share stopped (srcObject cleared): nothing went wrong
+  function playPreview(v) { v.play().catch(e => { if (!(e && e.name === 'AbortError')) roomError('Could not show the preview of your screen')(e); }); }
   function screenOff() {
+    showMyScreen(null);
     screenPub = null;
     $('screenBtn').innerHTML = '🖥 Show my screen'; $('screenBtn').classList.remove('screenOn'); app.classList.remove('sharingScreen');
     render();
@@ -571,7 +600,8 @@
       }
     } catch (e) {}
   });
-  room.on(RoomEvent.Disconnected, () => { $('who').textContent = 'Disconnected. Reload to rejoin.'; });
+  // livekit-client stops every local track on disconnect without an 'ended' event, so the screen state is reset here
+  room.on(RoomEvent.Disconnected, () => { $('who').textContent = 'Disconnected. Reload to rejoin.'; if (screenPub) screenOff(); });
   room.on(RoomEvent.Reconnecting, () => log('Reconnecting…', 'warn'));
   room.on(RoomEvent.Reconnected, () => log(''));
 
@@ -607,6 +637,9 @@
   const wb = $('whisperBtn');
   wb.onmousedown = () => whisper(true); wb.onmouseup = wb.onmouseleave = () => whisper(false);
 
+  // moving the app into or out of the pop-out can pause a playing video, so the preview of my screen is restarted
+  function replayPreview() { const v = $('myScreen').querySelector('video'); if (v.srcObject) playPreview(v); }
+
   // Pop out into an always-on-top mini window (Chrome 116+)
   $('popBtn').onclick = async () => {
     if (!('documentPictureInPicture' in window)) { log('Pop out needs Chrome 116 or newer.', 'warn'); return; }
@@ -615,8 +648,9 @@
     pip.document.body.style.background = getComputedStyle(document.body).background;
     app.classList.add('compact');
     pip.document.body.appendChild(app);
+    replayPreview();
     bindKeys(pip);
-    pip.addEventListener('pagehide', () => { app.classList.remove('compact'); document.body.appendChild(app); });
+    pip.addEventListener('pagehide', () => { app.classList.remove('compact'); document.body.appendChild(app); replayPreview(); });
   };
 
   // ---- go ----
