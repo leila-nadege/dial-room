@@ -17,7 +17,9 @@
     removeItem: (k) => { store.delete(k); }, clear: () => store.clear(),
   } });
 
-  const picker = { calls: [], next: null, endBeforePublish: false };   // next: an Error the next getDisplayMedia call throws
+  const picker = { calls: [], next: null, endBeforePublish: false, focus: [], refuseFocus: null };
+  // Chrome's CaptureController: records the focus behaviour the page asks for; refuseFocus makes it throw that error
+  window.CaptureController = class { setFocusBehavior(f) { if (picker.refuseFocus) { const e = picker.refuseFocus; picker.refuseFocus = null; throw e; } picker.focus.push(f); } };   // next: an Error the next getDisplayMedia call throws
   navigator.mediaDevices.getUserMedia = async () => new AudioContext().createMediaStreamDestination().stream;
   navigator.mediaDevices.getDisplayMedia = async (opts) => {
     picker.calls.push(opts);

@@ -87,27 +87,51 @@
     const mine = R.local.pubs.find(p => p.trackName === 'screen');
     check('my screen is asked for without sound', opts && opts.audio === false, opts);
     check('the picker offers tabs and windows, not a whole monitor', opts && opts.monitorTypeSurfaces === 'exclude', opts);
+    check('Chrome is asked to keep me in the Dial Room after picking', !!opts.controller && R.picker.focus.at(-1) === 'no-focus-change', R.picker.focus);
+    const preview = d.querySelector('#myScreen video');
+    check('I see a small preview of what the room sees', !hidden('myScreen') && !!preview.srcObject && preview.srcObject.getVideoTracks()[0] === mine.track.mediaStreamTrack);
     check('my screen is published as a screen share', !!mine && mine.source === 'screen_share', mine && mine.source);
     check('showing my screen adds no other track', R.local.pubs.filter(p => p.source !== 'screen_share').length === audioBefore);
     check('I am told my screen is showing', d.getElementById('screenStatus').textContent.includes('Your screen is showing'));
     R.setAttrs('harry', { state: 'floor', watching: 'me' }); await wait(50);
     check('I see who is watching', d.getElementById('screenStatus').textContent.includes('Watching: Harry'));
     d.getElementById('app').classList.add('compact');
-    check('in the pop-out, the stop button stays visible while sharing', w.getComputedStyle(d.getElementById('ctrlRow')).display !== 'none');
+    const shownNow = (id) => w.getComputedStyle(d.getElementById(id)).display !== 'none';
+    check('in the pop-out, the stop button stays visible while sharing', shownNow('ctrlRow') && shownNow('screenBtn'));
+    check('in the pop-out, the other controls stay hidden while sharing', !shownNow('micBtn') && !shownNow('camBtn') && !shownNow('popBtn'));
+    check('in the pop-out, the watcher line shows while sharing', shownNow('screenStatus'));
     d.getElementById('app').classList.remove('compact');
     const unpublishesBefore = R.local.unpublishCalls || 0;
     mine.track.mediaStreamTrack.dispatchEvent(new Event('ended')); await wait(150);
     check("Chrome's Stop sharing bar unpublishes and stops my screen", !R.local.pubs.some(p => p.trackName === 'screen') && mine.track.stopped);
     check("the page does not unpublish a second time after Chrome's bar", (R.local.unpublishCalls || 0) === unpublishesBefore + 1, (R.local.unpublishCalls || 0) - unpublishesBefore);
     d.getElementById('app').classList.add('compact');
-    check('in the pop-out, the controls hide again once sharing stops', w.getComputedStyle(d.getElementById('ctrlRow')).display === 'none');
+    const shown = (id) => w.getComputedStyle(d.getElementById(id)).display !== 'none';
+    check('in the pop-out, a share cannot be started (Chrome could offer the pop-out itself)', !shown('ctrlRow') && d.getElementById('screenBtn').getClientRects().length === 0);
+    check('in the pop-out, an empty status line stays hidden', !shown('screenStatus'));
     d.getElementById('app').classList.remove('compact');
     check('the button goes back after a stop', d.getElementById('screenBtn').textContent.includes('Show my screen'));
+    check('the preview goes away when my screen stops', hidden('myScreen') && !d.querySelector('#myScreen video').srcObject);
 
     d.getElementById('screenBtn').click(); await wait(150);
     const again = R.local.pubs.find(p => p.trackName === 'screen');
     d.getElementById('screenBtn').click(); await wait(150);
     check('the button stops my screen', !R.local.pubs.some(p => p.trackName === 'screen') && again.track.stopped);
+
+    const refused = new Error('not now'); refused.name = 'InvalidStateError'; R.picker.refuseFocus = refused;
+    d.getElementById('screenBtn').click(); await wait(150);
+    check('if Chrome will not keep me in the room, the share still starts', R.local.pubs.some(p => p.trackName === 'screen') && !hidden('myScreen'));
+    d.getElementById('screenBtn').click(); await wait(150);
+    R.picker.refuseFocus = new Error('odd failure');
+    d.getElementById('screenBtn').click(); await wait(150);
+    check('an unexpected refusal is noted and the share still starts', R.local.pubs.some(p => p.trackName === 'screen') && d.getElementById('log').textContent.includes('odd failure'));
+    d.getElementById('screenBtn').click(); await wait(150);
+
+    d.getElementById('screenBtn').click(); await wait(150);
+    const beforeDrop = R.local.pubs.find(p => p.trackName === 'screen');
+    R.room.emit('d'); await wait(100);
+    check('a dropped connection resets the button and the preview', !!beforeDrop && d.getElementById('screenBtn').textContent.includes('Show my screen') && hidden('myScreen'));
+    R.local.pubs = R.local.pubs.filter(p => p !== beforeDrop);   // livekit-client unpublishes everything on disconnect
 
     const published = R.local.publishCount;
     d.getElementById('screenBtn').click(); d.getElementById('screenBtn').click(); await wait(200);
@@ -131,6 +155,9 @@
     R.picker.next = cancel;
     d.getElementById('screenBtn').click(); await wait(100);
     check('closing the picker says cancelled', d.getElementById('screenStatus').textContent.includes('cancelled'));
+    d.getElementById('app').classList.add('compact');
+    check('in the pop-out, that message shows too', w.getComputedStyle(d.getElementById('screenStatus')).display !== 'none');
+    d.getElementById('app').classList.remove('compact');
     R.picker.next = new Error('picker broke');
     d.getElementById('screenBtn').click(); await wait(100);
     check('a picker failure is shown with its reason', d.getElementById('screenStatus').textContent.includes('picker broke'));
