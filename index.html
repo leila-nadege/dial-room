@@ -166,18 +166,29 @@
   const $ = (id) => app.querySelector('#' + id) || document.getElementById(id);
   const log = (m, cls) => { const el = $('log'); el.className = 'status ' + (cls || ''); el.textContent = m; };
 
-  // ---- token from URL fragment ----
+  // ---- the pass: where to connect (the LiveKit server) and the ticket, only ever from the pass desk ----
+  // A pass is accepted only from the pass desk, through the name and PIN sign-in, and saved under PASS_KEY. A pass in
+  // a link (#u=...&t=...) is ignored: a crafted link could otherwise point this page, with your mic and the call audio,
+  // at someone else's server.
   const DESK = 'https://znipnpcwnctcmtwhuaba.supabase.co/functions/v1/dialroom-token';
-  let params = new URLSearchParams(location.hash.slice(1));
+  const PASS_KEY = 'dialroom-pass';
+  // an encrypted address (livekit-client takes https:// and switches it to wss://); anything else is refused
+  const isServer = (u) => typeof u === 'string' && /^(wss|https):\/\/[^\s/]+/.test(u);
+  const linkPass = new URLSearchParams(location.hash.slice(1));
+  const linkHadPass = linkPass.has('t') || linkPass.has('u');
+  if (linkHadPass) history.replaceState(null, '', location.href.split('#')[0]);   // and off the address bar
+  let params = new URLSearchParams();
+  // storage can be blocked (a private window, cleared site data); the page then signs in every time
   try {
-    if (params.get('t')) localStorage.setItem('dialroom', location.hash.slice(1));
-    else if (localStorage.getItem('dialroom')) params = new URLSearchParams(localStorage.getItem('dialroom'));
+    localStorage.removeItem('dialroom');   // saved by older copies of this page, which also took passes from links
+    params = new URLSearchParams(localStorage.getItem(PASS_KEY) || '');
   } catch (e) {}
   let token = params.get('t');
   let url = params.get('u');
+  if (!isServer(url)) { token = null; url = null; }
   // a saved pass that has expired (or is about to) sends you back to the sign-in
   try {
-    if (token) { const c = JSON.parse(atob(token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/'))); if (c.exp && c.exp < Date.now() / 1000 + 300) { token = null; url = null; localStorage.removeItem('dialroom'); } }
+    if (token) { const c = JSON.parse(atob(token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/'))); if (c.exp && c.exp < Date.now() / 1000 + 300) { token = null; url = null; localStorage.removeItem(PASS_KEY); } }
   } catch (e) { token = null; url = null; }
 
   function login() {
@@ -186,7 +197,8 @@
       card.innerHTML = `<div><b>Who are you?</b></div>
         <div id="names" style="display:flex;flex-wrap:wrap;gap:6px;margin:8px 0"></div>
         <div style="display:flex;gap:6px"><input id="pin" placeholder="Floor PIN" inputmode="numeric" style="flex:1"><button class="primary" id="joinBtn">Join</button></div>
-        <div class="status" id="loginMsg">Loading names…</div>`;
+        <div class="status" id="loginMsg">Loading names…</div>
+        <div class="status warn${linkHadPass ? '' : ' hidden'}" id="loginNote">That link carried a pass, which the Dial Room no longer accepts. Sign in with your name and PIN.</div>`;
       app.insertBefore(card, $('setup'));
       $('who').textContent = 'Sign in below.';
       let picked = null;
@@ -206,6 +218,9 @@
           const r = await fetch(DESK, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: picked, pin: $('pin').value }) });
           const d = await r.json();
           if (!r.ok) { $('loginMsg').textContent = d.error === 'wrong pin' ? 'Wrong PIN.' : ('Could not join: ' + (d.error || r.status)); return; }
+          // never connect anywhere but an encrypted server the desk named: a reply without one stops here, with the
+          // sign-in still open to try again
+          if (!isServer(d.url) || typeof d.token !== 'string') { $('loginMsg').textContent = 'The pass desk sent a pass this page does not recognise. Tell Harry.'; return; }
           card.remove(); resolve(d);
         } catch (e) { $('loginMsg').textContent = 'Pass desk not reachable. Try again in a minute.'; }
       }
@@ -220,13 +235,13 @@
       const c = JSON.parse(atob(token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/')));
       const r = await fetch(DESK, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: c.sub, check: true }) });
       const d = await r.json();
-      if (r.ok && d.active === false) { token = null; url = null; localStorage.removeItem('dialroom'); }
+      if (r.ok && d.active === false) { token = null; url = null; localStorage.removeItem(PASS_KEY); }
     } catch (e) {} // desk unreachable: keep the saved pass, LiveKit still decides
   }
   if (!token || !url) {
     const got = await login();
     token = got.token; url = got.url;
-    try { localStorage.setItem('dialroom', 'u=' + encodeURIComponent(url) + '&t=' + token); } catch (e) {}
+    try { localStorage.setItem(PASS_KEY, 'u=' + encodeURIComponent(url) + '&t=' + encodeURIComponent(token)); } catch (e) {}
   }
   let claims = {};
   try { claims = JSON.parse(atob(token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/'))); } catch (e) {}
@@ -778,8 +793,8 @@
     } catch (e) { $('camBtn').disabled = true; $('camBtn').textContent = 'No camera'; }
     tileFor(myId, myName + ' (you)').classList.add('me');   // with or without a camera: reactions play on it
     await pushAttrs();
-    $('who').innerHTML = `You are ${myName}. Room: floor. <a href="#" id="switch">Not you?</a>`;
-    $('switch').onclick = (e) => { e.preventDefault(); try { localStorage.removeItem('dialroom'); } catch (x) {} location.hash = ''; location.reload(); };
+    $('who').innerHTML = `You are ${esc(myName)}. Room: floor. <a href="#" id="switch">Not you?</a>`;
+    $('switch').onclick = (e) => { e.preventDefault(); try { localStorage.removeItem(PASS_KEY); } catch (x) {} location.reload(); };
     applySubscriptions(); render(); drawChat();
   } catch (e) {
     $('who').textContent = 'Could not connect: ' + (e && e.message ? e.message : e);

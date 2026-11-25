@@ -31,7 +31,7 @@
 
   const b64 = (o) => btoa(JSON.stringify(o)).replace(/=+$/, '').replace(/\+/g, '-').replace(/\//g, '_');
   const token = b64({ alg: 'HS256' }) + '.' + b64({ sub: 'me', name: 'Me', exp: Math.floor(Date.now() / 1000) + 3600 }) + '.test';
-  const realPassBefore = localStorage.getItem('dialroom');
+  const realPassBefore = localStorage.getItem('dialroom-pass'), oldPassBefore = localStorage.getItem('dialroom');
   try {
   const pass = 'u=' + encodeURIComponent('wss://stand-in') + '&t=' + token;
   const page = await (await fetch('../index.html', { cache: 'no-store' })).text();
@@ -202,6 +202,55 @@
     check('after the gap I can react again', R.local.sent.length === 2 && R.local.sent[1].msg.k === 'money');
     R.leave('kay'); await wait(50);
 
+    // ---- the pass: only from the pass desk, never from a link ----
+    const fresh = async (setup) => {
+      const f = document.createElement('iframe'); f.style.cssText = 'width:460px;height:260px';
+      document.body.appendChild(f);
+      f.srcdoc = page.replace(cdn, '<script>' + setup + '<\/script><script src="stand-in-room.js"><\/script>');
+      await new Promise(r => f.onload = r); await wait(400);
+      return f;
+    };
+    const evil = 'u=' + encodeURIComponent('wss://not-ours.example') + '&t=' + token;
+    let f = await fresh('location.hash = ' + JSON.stringify(evil) + ';');
+    check('a pass in a link is ignored: the page asks for name and PIN', !!f.contentDocument.getElementById('loginCard') && !f.contentWindow.__room);
+    check('a pass in a link is not saved', !f.contentWindow.__store.has('dialroom-pass') && !f.contentWindow.__store.has('dialroom'));
+    check('a pass in a link is taken off the address bar', f.contentWindow.location.hash === '', f.contentWindow.location.hash);
+    check('the sign-in says why (which also proves the page saw the link)', !f.contentDocument.getElementById('loginNote').classList.contains('hidden'));
+    f.remove();
+
+    f = await fresh('window.__oldPass = ' + JSON.stringify(evil) + ';');
+    check('a pass saved by the old page is dropped once, and the page asks for name and PIN', !!f.contentDocument.getElementById('loginCard') && !f.contentWindow.__store.has('dialroom'));
+    check('no link, no note', f.contentDocument.getElementById('loginNote').classList.contains('hidden'));
+    f.remove();
+
+    f = await fresh('window.__testPass = ' + JSON.stringify('u=' + encodeURIComponent('http://not-encrypted.example') + '&t=' + token) + ';');
+    check('a saved pass without an encrypted server address is not used', !!f.contentDocument.getElementById('loginCard') && !f.contentWindow.__room);
+    f.remove();
+    f = await fresh('window.__testPass = ' + JSON.stringify('u=' + encodeURIComponent('https://room.example') + '&t=' + token) + ';');
+    check('a saved pass with an https:// server is used (livekit-client takes it)', f.contentWindow.__room && f.contentWindow.__room.room.connectedTo === 'https://room.example');
+    f.remove();
+
+    const signIn = async (login) => {
+      const g = await fresh('window.__desk = ' + JSON.stringify({ names: [{ name: 'me', display: 'Me' }], login }) + ';');
+      const gd = g.contentDocument;
+      gd.querySelector('#names button').click(); gd.getElementById('pin').value = '1234'; gd.getElementById('joinBtn').click();
+      await wait(400);
+      return g;
+    };
+    f = await signIn({ token, url: 'wss://desk-room.example' });
+    check('signing in with name and PIN connects to the server the pass desk names', f.contentWindow.__room && f.contentWindow.__room.room.connectedTo === 'wss://desk-room.example');
+    check('and that pass is saved for next time', (f.contentWindow.__store.get('dialroom-pass') || '').includes(encodeURIComponent('wss://desk-room.example')));
+    f.remove();
+    f = await signIn({ token, url: 'http://not-encrypted.example' });
+    check('a pass from the desk without an encrypted server is refused, with the sign-in still open', !f.contentWindow.__room && !!f.contentDocument.getElementById('loginCard') && f.contentDocument.getElementById('loginMsg').textContent.includes('does not recognise'));
+    f.remove();
+
+    const badName = b64({ alg: 'HS256' }) + '.' + b64({ sub: 'me', name: '<img src=x onerror="window.__xss=1">', exp: Math.floor(Date.now() / 1000) + 3600 }) + '.test';
+    f = await fresh('window.__testPass = ' + JSON.stringify('u=' + encodeURIComponent('wss://stand-in') + '&t=' + badName) + ';');
+    await wait(200);
+    check('a name with HTML in the pass shows as text', !f.contentWindow.__xss && !f.contentDocument.querySelector('#who img') && f.contentDocument.getElementById('who').textContent.includes('<img'));
+    f.remove();
+
     R.addRemote('x', '<img src=x onerror="window.__xss=1">'); await wait(100);
     check('a name with HTML in it shows as text, not markup', !w.__xss && !d.querySelector('#people img'));
     R.leave('x'); await wait(50);
@@ -223,7 +272,7 @@
   } catch (e) {
     check('the run finished without an error', false, String(e && e.stack || e));
   } finally {
-    check("the real saved pass is untouched", localStorage.getItem('dialroom') === realPassBefore);
+    check("the real saved pass is untouched", localStorage.getItem('dialroom-pass') === realPassBefore && localStorage.getItem('dialroom') === oldPassBefore);
     finish();
   }
 

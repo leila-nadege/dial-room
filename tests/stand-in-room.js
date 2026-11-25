@@ -11,7 +11,9 @@
 
   // The test page is served on the same origin as the real Dial Room, so the page under test gets an in-memory
   // localStorage seeded with the test's fake pass, and a caller's real saved pass is never read or overwritten.
-  const store = new Map(window.__testPass ? [['dialroom', window.__testPass]] : []);
+  // __testPass is a pass as the pass desk would have saved it; __oldPass one saved by an older copy of the page
+  const store = new Map([...(window.__testPass ? [['dialroom-pass', window.__testPass]] : []), ...(window.__oldPass ? [['dialroom', window.__oldPass]] : [])]);
+  window.__store = store;
   Object.defineProperty(window, 'localStorage', { configurable: true, value: {
     getItem: (k) => (store.has(k) ? store.get(k) : null), setItem: (k, v) => { store.set(k, String(v)); },
     removeItem: (k) => { store.delete(k); }, clear: () => store.clear(),
@@ -35,7 +37,13 @@
     if (picker.endBeforePublish) { picker.endBeforePublish = false; s.getVideoTracks()[0].stop(); }
     return s;
   };
-  window.fetch = async () => new Response(JSON.stringify({ active: true, names: [] }), { status: 200 });
+  // the pass desk: names on GET, {active} for a check, and window.__desk.login (or a refusal) for a sign-in
+  window.fetch = async (u, o) => {
+    const desk = window.__desk || {}, body = o && o.body ? JSON.parse(o.body) : null;
+    if (!body) return new Response(JSON.stringify({ names: desk.names || [] }), { status: 200 });
+    if (body.check) return new Response(JSON.stringify({ active: true }), { status: 200 });
+    return desk.login ? new Response(JSON.stringify(desk.login), { status: 200 }) : new Response(JSON.stringify({ error: 'wrong pin' }), { status: 403 });
+  };
 
   const Track = { Kind: { Video: 'video', Audio: 'audio' }, Source: { Microphone: 'microphone', Camera: 'camera', ScreenShare: 'screen_share', ScreenShareAudio: 'screen_share_audio', Unknown: 'unknown' } };
   const RoomEvent = { TrackSubscribed: 'ts', TrackUnsubscribed: 'tu', TrackPublished: 'tp', TrackUnpublished: 'tunp', ParticipantConnected: 'pc', ParticipantDisconnected: 'pd', ParticipantAttributesChanged: 'pac', DataReceived: 'dr', Disconnected: 'd', Reconnecting: 'rg', Reconnected: 'rd' };
@@ -85,7 +93,7 @@
     }
     on(e, f) { (this.handlers[e] = this.handlers[e] || []).push(f); return this; }
     emit(e, ...a) { (this.handlers[e] || []).forEach(f => f(...a)); }
-    async connect() {}
+    async connect(url, token) { this.connectedTo = url; this.connectedWith = token; }
     async startAudio() {}
   }
 
